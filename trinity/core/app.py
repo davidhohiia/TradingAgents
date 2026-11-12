@@ -9,10 +9,14 @@ from trinity.ai.anomaly_detector import AnomalyDetector
 from trinity.bots.arbitrage.bot import ArbitrageBot
 from trinity.bots.arbitrage.scanner import VenueLimits
 from trinity.bots.base import BaseBot
-from trinity.bots.crypto_grid.bot import CryptoGridBot
+from trinity.bots.crypto_momentum.bot import CryptoMomentumBot
 from trinity.bots.stock_trend.bot import StockTrendBot
 from trinity.config.settings import AppConfig, Settings, secret_value
 from trinity.core.capital_allocator import CapitalAllocator
+from trinity.core.capital_growth import CapitalGrowthManager
+from trinity.core.live_guard import check_tests
+from trinity.monitoring.api_monitor import ApiMonitor
+from trinity.risk.leverage import LeverageGuard
 from trinity.core.clock import Clock, RealClock
 from trinity.core.execution_engine import ExecutionEngine, ReconcileReport
 from trinity.core.log import get_logger
@@ -28,7 +32,7 @@ from trinity.exchanges.base_exchange import (
     NotConfigured,
     ReadOnlyMarketData,
 )
-from trinity.exchanges.crypto_exchange import CCXTExchange
+from trinity.exchanges.crypto_exchange import CCXTDerivativesExchange, CCXTExchange
 from trinity.exchanges.paper_exchange import PaperExchange
 from trinity.exchanges.stock_broker import AlpacaBroker, AlpacaDataProvider, CsvStockData
 from trinity.notifications.notifier import LogNotifier, MultiNotifier, Notifier
@@ -94,8 +98,8 @@ def build_app(
     strategies = config.strategies
 
     # ---------------------------------------------------------------- market data
-    if crypto_data is None and strategies.crypto_grid.enabled:
-        fallback = {s: config.instruments[s].to_market_info(s) for s in strategies.crypto_grid.symbols}
+    if crypto_data is None and strategies.crypto_momentum.enabled:
+        fallback = {s: config.instruments[s].to_market_info(s) for s in strategies.crypto_momentum.symbols}
         crypto_data = CCXTExchange(
             settings.crypto_exchange_id,
             api_key=secret_value(settings.crypto_api_key) if mode == Mode.LIVE else None,
@@ -115,18 +119,28 @@ def build_app(
         else:
             notes.append("stock_trend: no market data provider configured (set ALPACA keys) -> bot not started")
 
+    # every external data source / venue is timed by the API monitor
+    api_monitor = ApiMonitor()
+    if crypto_data is not None:
+        raw_crypto = crypto_data
+        crypto_data = api_monitor.wrap(crypto_data, f"{getattr(raw_crypto, 'name', 'crypto')}-data")
+    else:
+        raw_crypto = None
+    if stock_data is not None:
+        stock_data = api_monitor.wrap(stock_data, f"{getattr(stock_data, 'name', 'stocks')}-data")
+
     # ---------------------------------------------------------------- venues
     venues: dict[str, BaseExchange] = {}
     if mode == Mode.PAPER:
         if crypto_data is not None:
-            venues["crypto"] = _paper_venue("crypto", crypto_data, config, strategies.crypto_grid.symbols, repo,
+            venues["crypto"] = _paper_venue("crypto", crypto_data, config, strategies.crypto_momentum.symbols, repo,
                                             clock, mode)
         if stock_data is not None:
             venues["stocks"] = _paper_venue("stocks", stock_data, config, strategies.stock_trend.symbols, repo,
                                             clock, mode, session_check=calendar.is_open)
     else:
-        if strategies.crypto_grid.enabled and isinstance(crypto_data, CCXTExchange):
-            crypto_data.name = "crypto"
+        if strategies.crypto_momentum.enabled and isinstance(raw_crypto, CCXTExchange):
+            raw_crypto.name = "crypto"
             venues["crypto"] = crypto_data
         if strategies.stock_trend.enabled:
             try:
@@ -142,21 +156,43 @@ def build_app(
 
     # ---------------------------------------------------------------- core services
     breakers = CircuitBreakerRegistry(config.risk.api_failure_threshold, config.risk.api_cooldown_seconds, clock)
-    risk = RiskManager(config, repo, mode, breakers, clock)
-    allocator = CapitalAllocator(config)
+    growth = CapitalGrowthManager(repo, config, clock)
+    leverage_guard = LeverageGuard(config.leverage, settings, repo, mode)
+    tests_ok = check_tests(clock.now()).ok
+    leverage_perm = leverage_guard.permission(clock.now(), tests_ok)
+    leverage_gw_venue = None
+    if mode == Mode.LIVE and leverage_perm.permitted and strategies.crypto_momentum.enabled:
+        perp = CCXTDerivativesExchange(
+            settings.crypto_perp_exchange_id or settings.crypto_exchange_id,
+            allowed_symbols=config.leverage.symbols, api_key=secret_value(settings.crypto_api_key),
+            api_secret=secret_value(settings.crypto_api_secret),
+            api_password=secret_value(settings.crypto_api_password))
+        perp.name = config.leverage.venue
+        venues[config.leverage.venue] = api_monitor.wrap(perp, config.leverage.venue)
+        closables.append(perp)
+        leverage_gw_venue = config.leverage.venue
+        notes.append(f"LIMITED LEVERAGE ACTIVE: isolated, max {config.leverage.max_leverage}x, {config.leverage.symbols}")
+    else:
+        notes.append("leverage OFF: " + "; ".join(leverage_perm.reasons[:3]))
+    risk = RiskManager(config, repo, mode, breakers, clock, leverage_guard=leverage_guard)
+    risk.tests_ok = tests_ok
+    allocator = CapitalAllocator(config, growth.allocation, growth.allocations)
     positions = PositionManager(repo, config, mode)
     engine = ExecutionEngine(config=config, repo=repo, mode=mode, risk=risk, allocator=allocator,
                              positions=positions, venues=venues, breakers=breakers, clock=clock,
-                             usdt_usd_rate=config.currency.usdt_usd_rate)
+                             usdt_usd_rate=config.currency.usdt_usd_rate, contributed_fn=growth.contributed)
     notifier = MultiNotifier(LogNotifier(), *(extra_notifiers or []))
     anomaly = AnomalyDetector()
 
     bots: list[BaseBot] = []
     common = {"repo": repo, "mode": mode, "clock": clock, "notifier": notifier}
-    if strategies.crypto_grid.enabled and "crypto" in venues:
-        bots.append(CryptoGridBot(strategies.crypto_grid, anomaly=anomaly,
-                                  gateway=OrderGateway(engine, strategies.crypto_grid.strategy_id, "crypto"),
-                                  market=ReadOnlyMarketData(venues["crypto"]), **common))
+    if strategies.crypto_momentum.enabled and "crypto" in venues:
+        cm = strategies.crypto_momentum
+        lev_gw = OrderGateway(engine, cm.strategy_id, leverage_gw_venue) if leverage_gw_venue else None
+        bots.append(CryptoMomentumBot(cm, config, anomaly=anomaly, leverage_gateway=lev_gw,
+                                      leverage=config.leverage.max_leverage if lev_gw else 1.0,
+                                      gateway=OrderGateway(engine, cm.strategy_id, "crypto"),
+                                      market=ReadOnlyMarketData(venues["crypto"]), **common))
     if strategies.stock_trend.enabled and "stocks" in venues:
         bots.append(StockTrendBot(strategies.stock_trend, config, calendar, anomaly=None,
                                   gateway=OrderGateway(engine, strategies.stock_trend.strategy_id, "stocks"),
@@ -167,7 +203,7 @@ def build_app(
             for ex_id in settings.arb_exchanges:
                 try:
                     src = CCXTExchange(ex_id)  # public market data only, never keys
-                    arb_sources[ex_id] = src
+                    arb_sources[ex_id] = api_monitor.wrap(src, f"{ex_id}-public")
                     closables.append(src)
                 except NotConfigured as exc:
                     notes.append(f"arbitrage: {exc}")
@@ -179,7 +215,7 @@ def build_app(
             notes.append("arbitrage: fewer than 2 exchanges configured -> scanner not started")
 
     pm = PortfolioManager(config=config, repo=repo, engine=engine, mode=mode, bots=bots, clock=clock,
-                          notifier=notifier)
+                          notifier=notifier, growth=growth, api_monitor=api_monitor)
     return App(settings, config, mode, repo, clock, engine, pm, notifier, venues, closables, notes)
 
 

@@ -48,7 +48,6 @@ from trinity.exchanges.base_exchange import (
     OrderNotFound,
     OrderRejected,
 )
-from trinity.exchanges.stock_broker import StockBroker
 from trinity.risk.circuit_breaker import CircuitBreakerRegistry
 from trinity.risk.exposure_manager import ExposureManager
 from trinity.risk.risk_manager import RiskContext, RiskManager
@@ -89,6 +88,7 @@ class ExecutionEngine:
         breakers: CircuitBreakerRegistry,
         clock: Clock | None = None,
         usdt_usd_rate: float = 1.0,
+        contributed_fn: Callable[[], float] | None = None,
     ) -> None:
         self.config = config
         self.repo = repo
@@ -100,6 +100,7 @@ class ExecutionEngine:
         self.breakers = breakers
         self.clock = clock or RealClock()
         self.usdt_usd_rate = usdt_usd_rate
+        self.contributed_fn = contributed_fn or (lambda: config.capital.total_capital_usd)
         self.exposure = ExposureManager(config.correlation_group)
         self.venue_connected: dict[str, bool] = dict.fromkeys(venues, True)
         self._lock = asyncio.Lock()
@@ -109,6 +110,23 @@ class ExecutionEngine:
             raise ValueError("live execution engine cannot use paper venues")
         if mode == Mode.PAPER and any(not v.is_paper for v in venues.values()):
             raise ValueError("paper execution engine must only use paper venues")
+
+    # ------------------------------------------------------------------ account metrics
+    def account_equity(self) -> float:
+        """Contributed capital (deposits) + net realized + unrealized PnL. Deposits are not profit."""
+        t = self.positions.totals()
+        return self.contributed_fn() + t["realized"] + t["unrealized"]
+
+    def open_risk(self, active: list[OrderRecord] | None = None) -> float:
+        """Risk-to-stop of all open positions plus pending entry orders."""
+        active = active if active is not None else self.repo.list_active_orders(self.mode)
+        risk = sum(p.risk_to_stop for p in self.positions.all(open_only=True))
+        for o in active:
+            if o.side != Side.BUY:
+                continue
+            px = o.price or o.avg_fill_price or 0.0
+            risk += o.remaining * (px - o.stop_price if o.stop_price and o.stop_price < px else px)
+        return risk
 
     # ------------------------------------------------------------------ callbacks
     def on_fill(self, strategy_id: str, cb: FillCallback) -> None:
@@ -225,17 +243,26 @@ class ExecutionEngine:
         exposure = self.exposure.snapshot(open_positions, active)
         realized = self.positions.realized_by_strategy().get(intent.strategy_id, 0.0)
         cap = self.allocator.compute(intent.strategy_id, positions_all, active, realized, self._fee_rates())
+        funding = None
+        if intent.leverage > 1.0 and hasattr(venue, "fetch_funding_rate"):
+            try:
+                funding = await venue.fetch_funding_rate(intent.symbol)
+            except ExchangeError as exc:
+                log.warning("funding rate unavailable for %s: %s", intent.symbol, exc)
         ctx = RiskContext(
             exposure=exposure, market=market, strategy_capital=cap.effective_capital,
             strategy_available=cap.available, now=now,
             venue_connected=self.venue_connected.get(intent.venue, False),
+            equity=self.account_equity(), open_risk=self.open_risk(active),
+            held_symbols=sorted({p.symbol for p in open_positions}), funding_rate_8h=funding,
         )
         decision = self.risk.check_order(intent, ctx)
         if not decision.approved:
             return reject(*decision.reasons)
 
         fee_rate = market.taker_fee if intent.order_type == OrderType.MARKET else max(market.maker_fee, market.taker_fee)
-        reserve = intent.notional * (1 + fee_rate) if intent.side == Side.BUY else 0.0
+        reserve = (intent.notional / max(intent.leverage, 1.0) + intent.notional * fee_rate
+                   if intent.side == Side.BUY else 0.0)
         if reserve and not self.allocator.reserve_inflight(intent.strategy_id, cid, reserve, cap.available):
             return reject("capital reservation failed (insufficient or duplicate)")
 
@@ -245,8 +272,19 @@ class ExecutionEngine:
             status=OrderStatus.PENDING_SUBMIT, price=intent.price, stop_price=intent.stop_price,
             take_profit=intent.take_profit, reduce_only=intent.side == Side.SELL, reserved_usd=reserve,
             reason=intent.reason, parent_client_order_id=intent.parent_client_order_id,
-            created_at=now, updated_at=now,
+            created_at=now, updated_at=now, sub_strategy=intent.sub_strategy, leverage=intent.leverage,
         )
+        if intent.leverage > 1.0:
+            # isolated margin + leverage must be set on the venue BEFORE the order (never increased later)
+            prepare = getattr(venue, "prepare_leverage", None)
+            if prepare is None:
+                self.allocator.release_inflight(cid)
+                return reject(f"venue {intent.venue} does not support isolated-margin leverage")
+            try:
+                await prepare(intent.symbol, intent.leverage)
+            except ExchangeError as exc:
+                self.allocator.release_inflight(cid)
+                return reject(f"could not set isolated leverage: {exc}")
         try:
             self.repo.insert_order(record)  # write-ahead
         finally:
@@ -331,7 +369,9 @@ class ExecutionEngine:
                     if record.side == Side.SELL:
                         pos = self.positions.get(record.strategy_id, record.venue, record.symbol)
                         fill.quantity = min(fill.quantity, pos.quantity)
-                    fill.realized_pnl = self.positions.apply_fill(fill, exit_reason=record.reason)
+                    fill.realized_pnl = self.positions.apply_fill(
+                        fill, exit_reason=record.reason, sub_strategy=record.sub_strategy, leverage=record.leverage,
+                        stop_price=record.stop_price, take_profit=record.take_profit)
                     self.repo.insert_execution(fill)
                     realized_total += fill.realized_pnl
                     fills.append(fill)
@@ -499,7 +539,7 @@ class ExecutionEngine:
                 if p.venue == venue_name:
                     base = venue.market_info(p.symbol).base
                     held[base] = held.get(base, 0.0) + p.quantity
-            if isinstance(venue, StockBroker):
+            if callable(getattr(venue, "fetch_positions", None)):
                 try:
                     broker_pos = await venue.fetch_positions()
                 except ExchangeError as exc:

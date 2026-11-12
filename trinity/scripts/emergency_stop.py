@@ -24,7 +24,7 @@ from trinity.config.settings import load_app_config, load_settings  # noqa: E402
 from trinity.core.models import Mode  # noqa: E402
 from trinity.database.repository import open_database  # noqa: E402
 from trinity.risk.circuit_breaker import CircuitBreakerRegistry  # noqa: E402
-from trinity.risk.risk_manager import DRAWDOWN_CONFIRM_PHRASE, RiskManager  # noqa: E402
+from trinity.risk.risk_manager import DRAWDOWN_CONFIRM_PHRASE, HARD_STOP_CLEAR_PHRASE, RiskManager  # noqa: E402
 
 
 def main() -> int:
@@ -33,6 +33,7 @@ def main() -> int:
     g.add_argument("--status", action="store_true")
     g.add_argument("--clear", action="store_true")
     g.add_argument("--confirm-drawdown", action="store_true")
+    g.add_argument("--clear-hard-stop", action="store_true")
     ap.add_argument("--mode", choices=["paper", "live", "both"], default="both")
     args = ap.parse_args()
     settings = load_settings()
@@ -55,6 +56,11 @@ def main() -> int:
                 current = float(input("Current portfolio equity in USD (from your own review): ").strip() or 0)
                 ok = current > 0 and rm.confirm_drawdown_review(typed, current)
                 print("drawdown lock cleared (live stays disabled until run_live.py confirmation)" if ok else "NOT cleared")
+            elif args.clear_hard_stop:
+                typed = input(f'[{mode.value}] Type "{HARD_STOP_CLEAR_PHRASE}" after a full review: ').strip()
+                current = float(input("Current portfolio equity in USD (from your own review): ").strip() or 0)
+                ok = current > 0 and rm.clear_hard_stop(typed, current)
+                print("hard stop cleared (live stays disabled until run_live.py confirmation)" if ok else "NOT cleared")
             else:
                 rm.emergency_stop("local emergency_stop.py")
                 print(f"[{mode.value}] EMERGENCY STOP ACTIVE: new orders blocked")

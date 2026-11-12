@@ -48,7 +48,8 @@ class PositionManager:
     def open_positions(self, strategy_id: str | None = None) -> list[Position]:
         return [p for p in self.all(True) if strategy_id is None or p.strategy_id == strategy_id]
 
-    def apply_fill(self, fill: Fill, exit_reason: str = "") -> float:
+    def apply_fill(self, fill: Fill, exit_reason: str = "", sub_strategy: str = "", leverage: float = 1.0,
+                   stop_price: float | None = None, take_profit: float | None = None) -> float:
         """Update the position for a fill. Returns realized PnL (net of fees) of this fill.
 
         Must be called inside the same DB transaction that stores the execution.
@@ -61,7 +62,18 @@ class PositionManager:
             p.avg_entry_price = cost / new_qty
             if not p.is_open:
                 p.opened_at = fill.ts
+                p.sub_strategy = sub_strategy
+                p.leverage = max(leverage, 1.0)
             p.quantity = new_qty
+            if stop_price:
+                p.stop_price = stop_price
+            if take_profit:
+                p.take_profit = take_profit
+            if p.leverage > 1.0:
+                from trinity.risk.leverage import liquidation_price_long
+
+                p.liquidation_price = liquidation_price_long(
+                    p.avg_entry_price, p.leverage, self.config.leverage.maintenance_margin_rate)
         else:
             if fill.quantity > p.quantity + 1e-9:
                 # Should be impossible (risk manager forbids shorting). Never create a short.
@@ -79,12 +91,14 @@ class PositionManager:
                 p.opened_at = None
                 p.stop_price = None
                 p.take_profit = None
+                p.liquidation_price = None
             p.realized_pnl += realized
             self.repo.upsert_trade_fill(
                 strategy_id=fill.strategy_id, venue=fill.venue, symbol=fill.symbol, mode=fill.mode,
                 quantity=qty, entry_price=entry_price, exit_price=fill.price, entry_time=entry_time,
                 exit_time=fill.ts, fees_usd=fill.fee_usd, realized_pnl=realized, exit_reason=exit_reason,
                 exit_client_order_id=fill.client_order_id, is_virtual=fill.mode == Mode.PAPER,
+                sub_strategy=p.sub_strategy or sub_strategy,
             )
         p.fees_paid += fill.fee_usd
         p.last_price = fill.price if p.last_price is None else p.last_price
@@ -97,6 +111,14 @@ class PositionManager:
         p = self.get(strategy_id, venue, symbol)
         p.stop_price = stop
         p.take_profit = take_profit
+        self.repo.upsert_position(p)
+
+    def apply_funding(self, strategy_id: str, venue: str, symbol: str, amount_usd: float, ts: datetime) -> None:
+        """Funding paid (positive) or received (negative) on a leveraged position: realized PnL."""
+        p = self.get(strategy_id, venue, symbol)
+        p.funding_paid += amount_usd
+        p.realized_pnl -= amount_usd
+        p.updated_at = ts
         self.repo.upsert_position(p)
 
     def mark_to_market(self, symbol: str, price: float, ts: datetime) -> None:

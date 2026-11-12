@@ -98,7 +98,7 @@ def test_committed_data_survives_unclean_shutdown(tmp_path):
 async def test_crash_after_send_before_ack_is_reconciled(tmp_path, config):
     s = build_system(tmp_path, config)
     b = await s.crypto_market.fetch_order_book("BTC/USDT")
-    intent = OrderIntent(strategy_id="crypto_grid", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
+    intent = OrderIntent(strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
                          order_type=OrderType.LIMIT, quantity=0.0003, reference_price=b.best_ask,
                          price=round(b.best_bid * 0.99, 2), stop_price=b.best_bid * 0.95, market_data_ts=b.ts,
                          asset_class=AssetClass.CRYPTO)
@@ -130,7 +130,7 @@ async def test_crash_before_send_marks_order_failed(tmp_path, config):
         raise SystemExit("crash before network call")
 
     s.crypto.create_order = crash
-    intent = OrderIntent(strategy_id="crypto_grid", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
+    intent = OrderIntent(strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
                          order_type=OrderType.MARKET, quantity=0.0003, reference_price=b.best_ask,
                          stop_price=b.best_ask * 0.97, market_data_ts=b.ts, asset_class=AssetClass.CRYPTO)
     with pytest.raises(SystemExit):
@@ -145,12 +145,12 @@ async def test_crash_before_send_marks_order_failed(tmp_path, config):
 async def test_positions_and_risk_state_survive_restart(tmp_path, config):
     s = build_system(tmp_path, config)
     b = await s.crypto_market.fetch_order_book("BTC/USDT")
-    await s.engine.submit(OrderIntent(strategy_id="crypto_grid", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
+    await s.engine.submit(OrderIntent(strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
                                       order_type=OrderType.MARKET, quantity=0.0003, reference_price=b.best_ask,
                                       stop_price=b.best_ask * 0.97, market_data_ts=b.ts, asset_class=AssetClass.CRYPTO))
     s.risk.emergency_stop("test")
     s2 = build_system(tmp_path, config, db_path=tmp_path / "test.db")
-    assert s2.positions.get("crypto_grid", "crypto", "BTC/USDT").quantity == pytest.approx(0.0003)
+    assert s2.positions.get("crypto_momentum", "crypto", "BTC/USDT").quantity == pytest.approx(0.0003)
     assert "emergency_stop" in s2.risk.blocking_locks()
 
 
@@ -220,7 +220,7 @@ def test_live_gate_fails_by_default(tmp_path, config):
 def _seed_paper_history(repo: Repository, days: int, trades: int, pnl_each: float) -> None:
     repo.add_equity_snapshot(START - timedelta(days=days), Mode.PAPER, 500, 500, 0, 0, 0, 0)
     for i in range(trades):
-        repo.upsert_trade_fill(strategy_id="crypto_grid", venue="crypto", symbol="BTC/USDT", mode=Mode.PAPER,
+        repo.upsert_trade_fill(strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", mode=Mode.PAPER,
                                quantity=0.001, entry_price=100, exit_price=101, entry_time=START, exit_time=START,
                                fees_usd=0.01, realized_pnl=pnl_each, exit_reason="tp",
                                exit_client_order_id=f"c{i}", is_virtual=True)

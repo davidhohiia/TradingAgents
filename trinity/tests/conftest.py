@@ -52,8 +52,9 @@ def build_system(tmp_path: Path, config: AppConfig, *, mode: Mode = Mode.PAPER, 
     repo.migrate()
     crypto_market = SimulatedMarket(
         "sim-crypto", AssetClass.CRYPTO,
-        [SymbolSpec("BTC/USDT", 60000, "15m", annual_vol=0.5, level_qty_usd=50_000),
-         SymbolSpec("ETH/USDT", 3000, "15m", annual_vol=0.6, level_qty_usd=50_000)],
+        [SymbolSpec("BTC/USDT", 60000, "1h", annual_vol=0.5, level_qty_usd=50_000),
+         SymbolSpec("ETH/USDT", 3000, "1h", annual_vol=0.6, level_qty_usd=50_000),
+         SymbolSpec("SOL/USDT", 150, "1h", annual_vol=0.8, level_qty_usd=50_000)],
         clock, seed=seed,
     )
     stock_market = SimulatedMarket(
@@ -63,7 +64,7 @@ def build_system(tmp_path: Path, config: AppConfig, *, mode: Mode = Mode.PAPER, 
          SymbolSpec("VTI", 250, "1Day", annual_vol=0.17, annual_drift=0.25, bar_volume=4_000_000, history_bars=260)],
         clock, seed=seed + 1,
     )
-    markets_c = {s: config.instruments[s].to_market_info(s) for s in ("BTC/USDT", "ETH/USDT")}
+    markets_c = {s: config.instruments[s].to_market_info(s) for s in ("BTC/USDT", "ETH/USDT", "SOL/USDT")}
     markets_s = {s: config.instruments[s].to_market_info(s) for s in ("SPY", "QQQ", "VTI")}
     crypto = PaperExchange("crypto", crypto_market, markets_c, {"USDT": crypto_balance}, clock=clock,
                            book_cache_seconds=0)

@@ -72,7 +72,8 @@ class ArbitrageScanner:
         self.limits = limits or {}
 
     def evaluate(
-        self, symbol: str, books: dict[str, OrderBook | BaseException], now: datetime
+        self, symbol: str, books: dict[str, OrderBook | BaseException], now: datetime,
+        latencies_ms: dict[str, float] | None = None,
     ) -> list[Opportunity]:
         c = self.cfg
         out: list[Opportunity] = []
@@ -93,6 +94,10 @@ class ArbitrageScanner:
                     age_ms = (now - b.ts).total_seconds() * 1000
                     if age_ms > c.max_quote_age_ms:
                         opp.reasons.append(f"stale quotes on {v}: {age_ms:.0f}ms")
+                for v in (buy_v, sell_v):
+                    lat = (latencies_ms or {}).get(v)
+                    if lat is not None and lat > c.max_fetch_latency_ms:
+                        opp.reasons.append(f"data delay on {v}: fetch took {lat:.0f}ms > {c.max_fetch_latency_ms:.0f}ms")
                 if abs((bb.ts - sb.ts).total_seconds() * 1000) > c.max_clock_skew_ms:
                     opp.reasons.append("order book snapshots too far apart in time")
                 if not bb.asks or not sb.bids:

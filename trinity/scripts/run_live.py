@@ -46,13 +46,13 @@ async def verify_venues(settings: Settings, config: AppConfig) -> LiveGateReport
 
     rep = LiveGateReport()
     s = config.strategies
-    if s.crypto_grid.enabled:
+    if s.crypto_momentum.enabled:
         ex = CCXTExchange(settings.crypto_exchange_id, api_key=secret_value(settings.crypto_api_key),
                           api_secret=secret_value(settings.crypto_api_secret),
                           api_password=secret_value(settings.crypto_api_password))
         try:
             await ex.connect()
-            missing = [sym for sym in s.crypto_grid.symbols if not ex.supports(sym)]
+            missing = [sym for sym in s.crypto_momentum.symbols if not ex.supports(sym)]
             await ex.fetch_balances()  # proves the key works (read permission)
             rep.add("crypto_exchange", not missing,
                     f"{settings.crypto_exchange_id}: " + (f"missing spot markets {missing}" if missing else "symbols OK"))

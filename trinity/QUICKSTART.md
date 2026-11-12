@@ -1,4 +1,4 @@
-# TRINITY — быстрый старт (PAPER, Windows 10/11)
+# TRINITY 3.0 — быстрый старт (PAPER, Windows 10/11)
 
 1. Установите Python 3.12 с https://www.python.org/downloads/ (отметьте «Add python.exe to PATH»).
 2. Скачайте/клонируйте репозиторий, откройте PowerShell в его корне.
@@ -17,7 +17,10 @@
    ```powershell
    powershell -ExecutionPolicy Bypass -File trinity\scripts\windows\register_autostart.ps1
    ```
-8. Аварийная остановка: `/emergency_stop` в Telegram или `trinity\scripts\windows\emergency_stop.bat`.
+8. Ежемесячное пополнение (попадает в резерв, не считается доходом):
+   `trinity\.venv\Scripts\python.exe trinity\scripts\capital.py --deposit 200`
+   Перераспределение из резерва — только `capital.py --propose` и `--approve ID` с подтверждением.
+9. Аварийная остановка: `/emergency_stop` в Telegram или `trinity\scripts\windows\emergency_stop.bat`.
 
 Linux/macOS: `bash trinity/scripts/install.sh`, затем `python trinity/scripts/run_paper.py`.
 

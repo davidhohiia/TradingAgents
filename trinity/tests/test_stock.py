@@ -250,3 +250,27 @@ def test_stale_completed_bar_filter_logic():
     now = datetime(2026, 3, 2, 15, tzinfo=UTC)
     bars = [now - timedelta(days=1), now.replace(hour=5)]
     assert [b for b in bars if b.date() < now.date()] == [bars[0]]
+
+
+# ---------------------------------------------------------------- breakout detection
+def test_stock_breakout_detection(config):
+    from trinity.bots.stock_trend.breakout import detect_breakout, evaluate_breakout_entry
+
+    cfg = config.strategies.stock_trend
+    closes = list(uptrend(120))
+    base = closes[-1]
+    closes += [base * (1 + 0.003 * np.sin(i)) for i in range(60)]
+    closes.append(base * 1.03)  # close above the 55-day high
+    df = daily_df(closes)
+    df.iloc[-1, df.columns.get_loc("volume")] = df["volume"].iloc[-30:-1].mean() * 2
+    level, why = detect_breakout(df, cfg)
+    assert level is not None, why
+    sig = compute_signals(df, cfg)
+    m = market(config)
+    d = evaluate_breakout_entry(df, sig, cfg.model_copy(update={"breakout": cfg.breakout.model_copy(
+        update={"max_extension_atr": 5})}), bid=sig.close, ask=sig.close * 1.0001, market=m, strategy_capital=3.75,
+        risk_pct=1.0, available_cash=100, max_order_notional=120, max_position_notional=60)
+    assert d.enter, d.reasons
+    assert d.stop < level < d.entry_price and d.sizing.risk_usd <= 3.75 + 1e-9
+    df.iloc[-1, df.columns.get_loc("volume")] = 1.0
+    assert detect_breakout(df, cfg)[0] is None  # no volume confirmation

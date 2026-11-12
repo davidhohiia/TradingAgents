@@ -26,7 +26,7 @@ from trinity.risk.risk_manager import DRAWDOWN_CONFIRM_PHRASE, RiskContext
 
 
 def intent(system, **kw) -> OrderIntent:
-    base = dict(strategy_id="crypto_grid", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
+    base = dict(strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
                 order_type=OrderType.LIMIT, quantity=0.0003, reference_price=60000.0, price=59900.0,
                 stop_price=57000.0, market_data_ts=system.clock.now(), asset_class=AssetClass.CRYPTO)
     base.update(kw)
@@ -78,24 +78,33 @@ def test_no_martingale_size_never_grows_after_loss():
 
 
 # ---------------------------------------------------------------- config validation
-def test_config_forbids_leverage_margin_short():
-    with pytest.raises(ValidationError):
-        RiskConfig(leverage=2)
-    with pytest.raises(ValidationError):
-        RiskConfig(allow_margin=True)
-    with pytest.raises(ValidationError):
-        RiskConfig(allow_short=True)
+def test_config_validation_of_risk_and_leverage_limits(config):
+    from trinity.config.settings import ABSOLUTE_MAX_LEVERAGE, LeverageConfig
+
     with pytest.raises(ValidationError):
         RiskConfig(max_risk_per_trade_pct=0.05)
+    with pytest.raises(ValidationError):  # tiers must be increasing
+        RiskConfig(drawdown_warning_pct=0.15, drawdown_reduce_pct=0.12)
+    with pytest.raises(ValidationError):  # absolute limit can never exceed 20%
+        RiskConfig(drawdown_emergency_pct=0.25)
+    with pytest.raises(ValidationError):
+        LeverageConfig(max_leverage=ABSOLUTE_MAX_LEVERAGE + 0.5)
+    with pytest.raises(ValidationError):
+        LeverageConfig(symbols=["SOL/USDT"])
+    r = config.risk
+    assert (r.max_risk_per_trade_pct, r.max_total_open_risk_pct, r.max_daily_loss_pct, r.max_weekly_loss_pct) == \
+        (0.0075, 0.03, 0.03, 0.06)
+    assert (r.drawdown_warning_pct, r.drawdown_reduce_pct, r.drawdown_live_lock_pct, r.drawdown_emergency_pct) == \
+        (0.10, 0.12, 0.15, 0.20)
+    assert config.leverage.enabled is False and config.leverage.max_leverage == 1.5
 
 
 def test_capital_config_reserve_and_sum(config):
-    assert config.capital.reserve_usd == 200
-    assert config.allocation("crypto_grid") == 150 and config.allocation("arbitrage") == 0
+    assert config.capital.reserve_usd == 250 and config.capital.reinvest_profits
+    assert config.allocation("crypto_momentum") == 150 and config.allocation("stock_trend") == 100
+    assert config.allocation("arbitrage") == 0
     with pytest.raises(ValidationError):
         CapitalConfig(total_capital_usd=500, allocations={"a": 400}, reserve_usd=200)
-    with pytest.raises(ValidationError):
-        CapitalConfig(total_capital_usd=500, allocations={"a": 100}, reserve_usd=200, allow_profit_reinvestment=True)
 
 
 # ---------------------------------------------------------------- order checks
@@ -135,7 +144,7 @@ def test_rejects_total_exposure(system):
 
 def test_rejects_correlated_exposure(system):
     snap = ExposureSnapshot()
-    snap.by_group["crypto_major"] = 140.0
+    snap.by_group["crypto_major"] = 160.0  # + 18 > 35% of 500
     d = system.risk.check_order(intent(system), ctx(system, snap))
     assert not d.approved and any("correlated" in r for r in d.reasons)
 
@@ -181,17 +190,17 @@ def test_order_rate_limit(system):
 def test_daily_loss_limit_locks_entries_until_next_day(system):
     rm = system.risk
     assert rm.on_equity(500) == []
-    actions = rm.on_equity(489.9)  # -10.1 USD <= -2% of 500
+    actions = rm.on_equity(484.9)  # -15.1 USD <= -3% of 500
     assert [a.kind for a in actions] == ["DAILY_LOCK"]
     assert "daily_loss_lock" in rm.blocking_locks()
     assert not rm.check_order(intent(system), ctx(system)).approved
     # reducing orders still allowed
     snap = ExposureSnapshot()
-    snap.position_qty[("crypto_grid", "BTC/USDT")] = 0.001
+    snap.position_qty[("crypto_momentum", "BTC/USDT")] = 0.001
     sell = intent(system, side=Side.SELL, quantity=0.0005, price=60000, stop_price=None)
     assert rm.check_order(sell, ctx(system, snap)).approved
     system.clock.advance(86400)
-    rm.on_equity(489.9)
+    rm.on_equity(484.9)
     assert "daily_loss_lock" not in rm.blocking_locks()
 
 
@@ -202,26 +211,113 @@ def test_daily_pnl_includes_unrealized_via_equity(system):
     assert st.daily_pnl == pytest.approx(-5)
 
 
+def _walk(rm, system, equities):
+    acts = []
+    for e in equities:
+        system.clock.advance(8 * 86400)  # new day and new week: isolate drawdown tiers from daily/weekly limits
+        acts += [x.kind for x in rm.on_equity(e)]
+    return acts
+
+
+def test_drawdown_tiers_warning_reduce_lock_hardstop(system):
+    rm = system.risk
+    rm.on_equity(1000)
+    assert _walk(rm, system, [895]) == ["DRAWDOWN_WARNING"]  # 10.5%
+    assert rm.activity_multiplier() == 1.0
+    assert _walk(rm, system, [875]) == ["REDUCED_ACTIVITY"]  # 12.5%
+    assert rm.activity_multiplier() == 0.5
+    assert rm.max_trade_risk_usd(875) == pytest.approx(875 * 0.0075 * 0.5)
+    assert _walk(rm, system, [845]) == ["DRAWDOWN_LOCK"]  # 15.5%
+    assert "drawdown_lock" in rm.blocking_locks() and rm.state.live_disabled
+    assert _walk(rm, system, [795]) == ["HARD_STOP"]  # 20.5%
+    assert "hard_stop" in rm.blocking_locks()
+
+
+def test_reduced_activity_halves_allowed_trade_risk(system):
+    rm = system.risk
+    rm.on_equity(500)
+    _walk(rm, system, [438])  # 12.4% drawdown
+    # 0.0006 * (60000-55000) = 3.0 > 0.75% x 0.5 x 438 = 1.64
+    d = rm.check_order(intent(system, quantity=0.0006, price=60000, stop_price=55000), ctx(system, equity=438))
+    assert not d.approved and any("x0.5" in r for r in d.reasons)
+
+
 def test_drawdown_lock_requires_manual_confirmation(system):
     rm = system.risk
     rm.on_equity(520)
-    system.clock.advance(86400)
-    acts = rm.on_equity(478)  # 8.08% below peak 520
-    assert "DRAWDOWN_LOCK" in [a.kind for a in acts]
+    _walk(rm, system, [440])  # 15.4% below peak 520
     assert "drawdown_lock" in rm.blocking_locks()
     ok, remaining = rm.resume()  # /resume must NOT clear it
     assert not ok and "drawdown_lock" in remaining
-    assert not rm.confirm_drawdown_review("yes", 478)
-    assert rm.confirm_drawdown_review(DRAWDOWN_CONFIRM_PHRASE, 478)
+    snap = ExposureSnapshot()
+    snap.position_qty[("crypto_momentum", "BTC/USDT")] = 0.001
+    plain = intent(system, side=Side.SELL, quantity=0.0005, price=60000, stop_price=None)
+    prot = intent(system, side=Side.SELL, quantity=0.0005, price=60000, stop_price=None, protective_exit=True)
+    assert not rm.check_order(plain, ctx(system, snap)).approved
+    assert rm.check_order(prot, ctx(system, snap)).approved
+    assert not rm.confirm_drawdown_review("yes", 440)
+    assert rm.confirm_drawdown_review(DRAWDOWN_CONFIRM_PHRASE, 440)
     assert "drawdown_lock" not in rm.blocking_locks()
     assert rm.state.live_disabled  # live stays disabled until run_live re-confirmation
 
 
-def test_drawdown_warning_before_lock(system):
+def test_hard_stop_requires_separate_manual_clear(system):
+    from trinity.risk.risk_manager import HARD_STOP_CLEAR_PHRASE
+
     rm = system.risk
     rm.on_equity(500)
-    acts = rm.on_equity(474)  # 5.2%
-    assert [a.kind for a in acts] == ["DAILY_LOCK", "DRAWDOWN_WARNING"]
+    _walk(rm, system, [395])
+    assert "hard_stop" in rm.blocking_locks()
+    assert not rm.resume()[0]
+    rm.confirm_drawdown_review(DRAWDOWN_CONFIRM_PHRASE, 395)
+    assert "hard_stop" in rm.blocking_locks()  # the 15% confirmation does not clear the 20% hard stop
+    assert not rm.clear_hard_stop("whatever", 395)
+    assert rm.clear_hard_stop(HARD_STOP_CLEAR_PHRASE, 395)
+    assert not {"hard_stop", "drawdown_lock"} & set(rm.blocking_locks())
+
+
+def test_weekly_loss_limit(system):
+    rm = system.risk
+    rm.on_equity(500)  # Monday
+    for e in (490, 480, 471):  # about -2% per day: never a daily lock, -5.8% for the week so far
+        system.clock.advance(86400)
+        rm.on_equity(e)
+    assert "weekly_loss_lock" not in rm.blocking_locks()
+    system.clock.advance(86400)
+    acts = [a.kind for a in rm.on_equity(469)]  # -6.2% for the week
+    assert "WEEKLY_LOCK" in acts and "weekly_loss_lock" in rm.blocking_locks()
+    assert not rm.check_order(intent(system), ctx(system)).approved
+    system.clock.advance(7 * 86400)
+    rm.on_equity(469)
+    assert "weekly_loss_lock" not in rm.blocking_locks()
+
+
+def test_total_open_risk_limit(system):
+    # existing open risk 13 USD + new trade 0.87 > 3% of 450 = 13.5
+    d = system.risk.check_order(intent(system), ctx(system, equity=450, open_risk=13.0))
+    assert not d.approved and any("total open risk" in r for r in d.reasons)
+    assert system.risk.check_order(intent(system), ctx(system, equity=450, open_risk=5.0)).approved
+
+
+def test_dynamic_correlation_blocks_duplicate_risk(system):
+    system.risk.update_correlations({("BTC/USDT", "ETH/USDT"): 0.91, ("ETH/USDT", "BTC/USDT"): 0.91})
+    d = system.risk.check_order(intent(system), ctx(system, held_symbols=["ETH/USDT"]))
+    assert not d.approved and any("highly correlated" in r for r in d.reasons)
+    system.risk.update_correlations({("BTC/USDT", "ETH/USDT"): 0.4, ("ETH/USDT", "BTC/USDT"): 0.4})
+    assert system.risk.check_order(intent(system), ctx(system, held_symbols=["ETH/USDT"])).approved
+
+
+def test_stock_leverage_always_forbidden(system):
+    m = system.config.instruments["SPY"].to_market_info("SPY")
+    i = intent(system, symbol="SPY", venue="stocks", asset_class=AssetClass.STOCK, price=500, reference_price=500,
+               stop_price=490, quantity=0.1, leverage=1.5)
+    d = system.risk.check_order(i, RiskContext(ExposureSnapshot(), m, 100, 100, system.clock.now()))
+    assert not d.approved and any("forbidden for stocks" in r for r in d.reasons)
+
+
+def test_crypto_leverage_rejected_without_permission(system):
+    d = system.risk.check_order(intent(system, leverage=1.5, venue="crypto_perp"), ctx(system))
+    assert not d.approved and any("leverage not permitted" in r for r in d.reasons)
 
 
 def test_drawdown_peak_survives_restart(system, tmp_path, config):
@@ -237,7 +333,7 @@ def test_emergency_stop_blocks_everything_including_exits(system):
     rm = system.risk
     rm.emergency_stop("test")
     snap = ExposureSnapshot()
-    snap.position_qty[("crypto_grid", "BTC/USDT")] = 0.001
+    snap.position_qty[("crypto_momentum", "BTC/USDT")] = 0.001
     sell = intent(system, side=Side.SELL, quantity=0.0005, price=60000, stop_price=None, protective_exit=True)
     assert not rm.check_order(sell, ctx(system, snap)).approved
     assert not rm.resume()[0]
@@ -250,7 +346,7 @@ def test_pause_allows_only_reducing(system):
     rm.pause()
     assert not rm.check_order(intent(system), ctx(system)).approved
     snap = ExposureSnapshot()
-    snap.position_qty[("crypto_grid", "BTC/USDT")] = 0.001
+    snap.position_qty[("crypto_momentum", "BTC/USDT")] = 0.001
     sell = intent(system, side=Side.SELL, quantity=0.0005, price=60000, stop_price=None)
     assert rm.check_order(sell, ctx(system, snap)).approved
     assert rm.resume() == (True, [])
@@ -286,39 +382,43 @@ def _order(sid, cid, qty, px, side=Side.BUY):
 
 def test_allocator_budget_reserved_deployed(config):
     a = CapitalAllocator(config)
-    c = a.compute("crypto_grid", [_pos("crypto_grid", 0.001, 60000)], [_order("crypto_grid", "c1", 0.0005, 60000)], 0)
+    c = a.compute("crypto_momentum", [_pos("crypto_momentum", 0.001, 60000)], [_order("crypto_momentum", "c1", 0.0005, 60000)], 0)
     assert c.deployed == pytest.approx(60) and c.reserved == pytest.approx(30)
     assert c.available == pytest.approx(60)
 
 
-def test_allocator_losses_reduce_profits_do_not_increase(config):
+def test_allocator_full_reinvestment(config):
     a = CapitalAllocator(config)
-    assert a.compute("crypto_grid", [], [], -20).effective_capital == pytest.approx(130)
-    assert a.compute("crypto_grid", [], [], +50).effective_capital == pytest.approx(150)
+    assert a.compute("crypto_momentum", [], [], -20).effective_capital == pytest.approx(130)
+    assert a.compute("crypto_momentum", [], [], +50).effective_capital == pytest.approx(200)  # 100% reinvestment
+    assert a.compute("arbitrage", [], [], +50).effective_capital == 0  # unfunded strategy never trades
+    no_reinvest = config.model_copy(deep=True)
+    no_reinvest.capital.reinvest_profits = False
+    assert CapitalAllocator(no_reinvest).compute("crypto_momentum", [], [], 50).effective_capital == 150
 
 
 def test_allocator_never_negative_and_no_double_reservation(config):
     a = CapitalAllocator(config)
-    c = a.compute("crypto_grid", [_pos("crypto_grid", 0.003, 60000)], [], 0)  # 180 deployed > 150
+    c = a.compute("crypto_momentum", [_pos("crypto_momentum", 0.003, 60000)], [], 0)  # 180 deployed > 150
     assert c.available == 0.0
-    assert a.reserve_inflight("crypto_grid", "x1", 50, 100)
-    assert not a.reserve_inflight("crypto_grid", "x1", 50, 100)  # same order twice
-    assert not a.reserve_inflight("crypto_grid", "x2", 60, 100)  # would exceed available
+    assert a.reserve_inflight("crypto_momentum", "x1", 50, 100)
+    assert not a.reserve_inflight("crypto_momentum", "x1", 50, 100)  # same order twice
+    assert not a.reserve_inflight("crypto_momentum", "x2", 60, 100)  # would exceed available
     a.release_inflight("x1")
-    assert a.reserve_inflight("crypto_grid", "x2", 60, 100)
+    assert a.reserve_inflight("crypto_momentum", "x2", 60, 100)
 
 
 def test_allocator_reserve_and_other_strategies_isolated(config):
     a = CapitalAllocator(config)
     assert a.compute("unknown", [], [], 0).available == 0
-    c = a.compute("stock_trend", [_pos("crypto_grid", 0.002, 60000)], [], 0)
-    assert c.available == 150  # crypto usage does not consume stock budget
+    c = a.compute("stock_trend", [_pos("crypto_momentum", 0.002, 60000)], [], 0)
+    assert c.available == 100  # crypto usage does not consume stock budget
 
 
 def test_exposure_manager_counts_pending_buys(config):
     em = ExposureManager(config.correlation_group)
-    snap = em.snapshot([_pos("crypto_grid", 0.001, 60000)],
-                       [_order("crypto_grid", "a", 0.0005, 60000), _order("crypto_grid", "b", 0.0002, 61000, Side.SELL)])
+    snap = em.snapshot([_pos("crypto_momentum", 0.001, 60000)],
+                       [_order("crypto_momentum", "a", 0.0005, 60000), _order("crypto_momentum", "b", 0.0002, 61000, Side.SELL)])
     assert snap.total == pytest.approx(90)
     assert snap.by_group["crypto_major"] == pytest.approx(90)
-    assert snap.pending_sell_qty[("crypto_grid", "BTC/USDT")] == pytest.approx(0.0002)
+    assert snap.pending_sell_qty[("crypto_momentum", "BTC/USDT")] == pytest.approx(0.0002)

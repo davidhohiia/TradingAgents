@@ -102,10 +102,15 @@ class TelegramControlCenter(Notifier):
             if cmd == "/trades":
                 rows = [dict(r) for r in pm.repo.list_trades(pm.mode, limit=10)]
                 return tpl.trades(rows, pm.mode.value)
-            if cmd in ("/grid", "/stocks", "/arbitrage"):
-                sid = {"/grid": "crypto_grid", "/stocks": "stock_trend", "/arbitrage": "arbitrage"}[cmd]
+            if cmd in ("/crypto", "/grid", "/stocks", "/arbitrage"):
+                sid = {"/crypto": "crypto_momentum", "/grid": "crypto_momentum", "/stocks": "stock_trend",
+                       "/arbitrage": "arbitrage"}[cmd]
                 bot = pm.bots.get(sid)
                 return tpl.bot_detail(bot.describe()) if bot else f"{sid} not running."
+            if cmd == "/capital":
+                return tpl.capital(pm.capital_data())
+            if cmd == "/strategies":
+                return tpl.strategies(pm.strategies_data())
             if cmd == "/risk":
                 return tpl.risk(pm.risk_data())
             if cmd == "/report":

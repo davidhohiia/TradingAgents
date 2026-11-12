@@ -26,6 +26,17 @@ instruments:
     min_notional: 5
     maker_fee: 0.001
     taker_fee: 0.001
+  SOL/USDT:
+    asset_class: crypto
+    base: SOL
+    quote: USDT
+    correlation_group: crypto_major
+    qty_step: 0.001
+    price_step: 0.01
+    min_qty: 0.001
+    min_notional: 5
+    maker_fee: 0.001
+    taker_fee: 0.001
   SPY:
     asset_class: stock
     base: SPY

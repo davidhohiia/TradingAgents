@@ -201,14 +201,14 @@ class Repository:
         self.execute(
             "INSERT INTO orders (client_order_id, exchange_order_id, strategy_id, venue, symbol, mode, side, "
             "order_type, quantity, price, stop_price, take_profit, reduce_only, status, filled_quantity, "
-            "avg_fill_price, fee_usd, reserved_usd, reason, parent_client_order_id, error, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "avg_fill_price, fee_usd, reserved_usd, reason, parent_client_order_id, error, created_at, updated_at, "
+            "sub_strategy, leverage) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 o.client_order_id, o.exchange_order_id, o.strategy_id, o.venue, o.symbol, o.mode.value,
                 o.side.value, o.order_type.value, o.quantity, o.price, o.stop_price, o.take_profit,
                 int(o.reduce_only), o.status.value, o.filled_quantity, o.avg_fill_price, o.fee_usd,
                 o.reserved_usd, o.reason, o.parent_client_order_id, o.error,
-                ts_to_str(o.created_at), ts_to_str(o.updated_at),
+                ts_to_str(o.created_at), ts_to_str(o.updated_at), o.sub_strategy, o.leverage,
             ),
         )
 
@@ -296,16 +296,20 @@ class Repository:
         self.execute(
             "INSERT INTO positions (strategy_id, venue, symbol, mode, asset_class, correlation_group, quantity, "
             "avg_entry_price, realized_pnl, fees_paid, last_price, unrealized_pnl, stop_price, take_profit, "
-            "opened_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "opened_at, updated_at, sub_strategy, leverage, liquidation_price, funding_paid) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(strategy_id, venue, symbol, mode) DO UPDATE SET quantity=excluded.quantity, "
             "avg_entry_price=excluded.avg_entry_price, realized_pnl=excluded.realized_pnl, "
             "fees_paid=excluded.fees_paid, last_price=excluded.last_price, unrealized_pnl=excluded.unrealized_pnl, "
             "stop_price=excluded.stop_price, take_profit=excluded.take_profit, opened_at=excluded.opened_at, "
-            "updated_at=excluded.updated_at, correlation_group=excluded.correlation_group",
+            "updated_at=excluded.updated_at, correlation_group=excluded.correlation_group, "
+            "sub_strategy=excluded.sub_strategy, leverage=excluded.leverage, "
+            "liquidation_price=excluded.liquidation_price, funding_paid=excluded.funding_paid",
             (
                 p.strategy_id, p.venue, p.symbol, p.mode.value, p.asset_class.value, p.correlation_group,
                 p.quantity, p.avg_entry_price, p.realized_pnl, p.fees_paid, p.last_price, p.unrealized_pnl,
                 p.stop_price, p.take_profit, ts_to_str(p.opened_at), ts_to_str(p.updated_at),
+                p.sub_strategy, p.leverage, p.liquidation_price, p.funding_paid,
             ),
         )
 
@@ -324,6 +328,7 @@ class Repository:
         self, *, strategy_id: str, venue: str, symbol: str, mode: Mode, quantity: float, entry_price: float,
         exit_price: float, entry_time: datetime | None, exit_time: datetime, fees_usd: float,
         realized_pnl: float, exit_reason: str, exit_client_order_id: str, is_virtual: bool,
+        sub_strategy: str = "",
     ) -> None:
         """Aggregate all partial fills of one exit order into a single round-trip trade row."""
         rows = self.query(
@@ -346,10 +351,11 @@ class Repository:
         else:
             self.execute(
                 "INSERT INTO trades (strategy_id, venue, symbol, mode, quantity, entry_price, exit_price, entry_time, "
-                "exit_time, fees_usd, realized_pnl, exit_reason, exit_client_order_id, is_virtual) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "exit_time, fees_usd, realized_pnl, exit_reason, exit_client_order_id, is_virtual, sub_strategy) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (strategy_id, venue, symbol, mode.value, quantity, entry_price, exit_price, ts_to_str(entry_time),
-                 ts_to_str(exit_time), fees_usd, realized_pnl, exit_reason, exit_client_order_id, int(is_virtual)),
+                 ts_to_str(exit_time), fees_usd, realized_pnl, exit_reason, exit_client_order_id, int(is_virtual),
+                 sub_strategy),
             )
 
     def list_trades(self, mode: Mode | None = None, limit: int = 100, strategy_id: str | None = None,
@@ -369,7 +375,8 @@ class Repository:
         params.append(limit)
         return self.query(sql, tuple(params))
 
-    def trade_stats(self, mode: Mode, strategy_id: str | None = None, since: datetime | None = None) -> dict[str, float]:
+    def trade_stats(self, mode: Mode, strategy_id: str | None = None, since: datetime | None = None,
+                    sub_strategy: str | None = None) -> dict[str, float]:
         sql = ("SELECT COUNT(*) n, COALESCE(SUM(realized_pnl),0) pnl, COALESCE(SUM(fees_usd),0) fees, "
                "COALESCE(SUM(CASE WHEN realized_pnl>0 THEN 1 ELSE 0 END),0) wins, "
                "COALESCE(SUM(CASE WHEN realized_pnl<=0 THEN 1 ELSE 0 END),0) losses, "
@@ -383,6 +390,9 @@ class Repository:
         if since:
             sql += " AND exit_time>=?"
             params.append(ts_to_str(since))
+        if sub_strategy is not None:
+            sql += " AND sub_strategy=?"
+            params.append(sub_strategy)
         r = self.query(sql, tuple(params))[0]
         return {k: r[k] for k in r.keys()}
 
@@ -497,6 +507,39 @@ class Repository:
             sql += " WHERE accepted=1"
         sql += " ORDER BY id DESC LIMIT ?"
         return self.query(sql, (limit,))
+
+    # ------------------------------------------------------------------ capital growth / monitoring
+    def add_deposit(self, ts: datetime, amount_usd: float, kind: str, note: str = "",
+                     currency: str = "USD", amount_original: float | None = None, fx_rate: float = 1.0) -> int:
+        cur = self.execute(
+            "INSERT INTO deposits (ts, amount_usd, currency, amount_original, fx_rate, kind, note) VALUES (?,?,?,?,?,?,?)",
+            (ts_to_str(ts), amount_usd, currency, amount_original if amount_original is not None else amount_usd,
+             fx_rate, kind, note),
+        )
+        return int(cur.lastrowid)
+
+
+    def list_deposits(self) -> list[sqlite3.Row]:
+        return self.query("SELECT * FROM deposits ORDER BY id")
+
+
+    def add_allocation_change(self, ts: datetime, strategy_id: str, delta: float, new_amount: float,
+                               reason: str, approved_by: str) -> None:
+        self.execute(
+            "INSERT INTO capital_allocations (ts, strategy_id, delta_usd, new_amount_usd, reason, approved_by) "
+            "VALUES (?,?,?,?,?,?)", (ts_to_str(ts), strategy_id, delta, new_amount, reason, approved_by))
+
+
+    def add_api_health(self, ts: datetime, venue: str, calls: int, errors: int, p50: float | None,
+                        p95: float | None, last_error: str | None) -> None:
+        self.execute("INSERT INTO api_health (ts, venue, calls, errors, p50_ms, p95_ms, last_error) VALUES (?,?,?,?,?,?,?)",
+                     (ts_to_str(ts), venue, calls, errors, p50, p95, last_error))
+
+
+    def add_funding_payment(self, ts: datetime, mode: Mode, strategy_id: str, symbol: str, rate: float,
+                             notional: float, amount: float) -> None:
+        self.execute("INSERT INTO funding_payments (ts, mode, strategy_id, symbol, rate, notional, amount_usd) "
+                     "VALUES (?,?,?,?,?,?,?)", (ts_to_str(ts), mode.value, strategy_id, symbol, rate, notional, amount))
 
 
 def _split_sql(sql: str) -> list[str]:

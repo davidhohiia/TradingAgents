@@ -106,7 +106,8 @@ def check_risk_config(rc: RiskConfig) -> GateCheck:
     except Exception as exc:  # noqa: BLE001
         return GateCheck("risk_limits", False, str(exc))
     return GateCheck("risk_limits", True,
-                     f"daily loss {rc.max_daily_loss_pct:.1%}, max DD {rc.max_drawdown_pct:.1%}, leverage 0")
+                     f"risk/trade {rc.max_risk_per_trade_pct:.2%}, daily {rc.max_daily_loss_pct:.0%}, "
+                     f"weekly {rc.max_weekly_loss_pct:.0%}, live lock at DD {rc.drawdown_live_lock_pct:.0%}")
 
 
 def evaluate_static_gate(settings: Settings, config: AppConfig, repo: Repository, now: datetime | None = None,
@@ -119,7 +120,7 @@ def evaluate_static_gate(settings: Settings, config: AppConfig, repo: Repository
             "LIVE_TRADING_ACKNOWLEDGEMENT must equal the exact phrase from .env.example")
     s = config.strategies
     creds = []
-    if s.crypto_grid.enabled and not settings.has_crypto_credentials():
+    if s.crypto_momentum.enabled and not settings.has_crypto_credentials():
         creds.append("CRYPTO_API_KEY/CRYPTO_API_SECRET")
     if s.stock_trend.enabled and not settings.has_alpaca_credentials():
         creds.append("ALPACA_API_KEY_ID/ALPACA_API_SECRET_KEY")
@@ -142,6 +143,9 @@ def evaluate_static_gate(settings: Settings, config: AppConfig, repo: Repository
     else:
         rep.add("paper_validation", True, "DISABLED in config (not recommended)")
     raw = repo.get_kv("risk:live:state") or {}
-    locked = [k for k in ("emergency_stop", "drawdown_lock") if raw.get(k)]
+    locked = [k for k in ("emergency_stop", "hard_stop", "drawdown_lock") if raw.get(k)]
     rep.add("risk_locks", not locked, "active: " + ", ".join(locked) if locked else "none")
+    rep.add("leverage", True,
+            "spot only at live start; leverage is evaluated separately by the LeverageGuard "
+            "(>= 60 days of successful live trading without leverage + approval)")
     return rep

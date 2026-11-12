@@ -21,6 +21,7 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 CONFIG_DIR = PROJECT_DIR / "config"
 
 LIVE_ACKNOWLEDGEMENT_PHRASE = "I UNDERSTAND THAT LIVE TRADING CAN LOSE REAL MONEY"
+LEVERAGE_ACKNOWLEDGEMENT_PHRASE = "I UNDERSTAND THAT LEVERAGE CAN LIQUIDATE MY POSITION"
 
 
 # --------------------------------------------------------------------------- env settings
@@ -34,6 +35,9 @@ class Settings(BaseSettings):
     paper_trading: bool = True
     live_trading: bool = False
     live_trading_acknowledgement: str = ""
+    live_leverage_enabled: bool = False
+    leverage_acknowledgement: str = ""
+    crypto_perp_exchange_id: str = ""
 
     database_path: Path = PROJECT_DIR / "data" / "trinity.db"
     backup_dir: Path = PROJECT_DIR / "data" / "backups"
@@ -104,11 +108,17 @@ def secret_value(value: SecretStr | None) -> str:
 
 
 # --------------------------------------------------------------------------- YAML models
+ABSOLUTE_MAX_LEVERAGE = 2.0  # hard programmatic cap; no configuration can exceed it
+
+
 class CapitalConfig(BaseModel):
     total_capital_usd: float = Field(gt=0)
     allocations: dict[str, float]
     reserve_usd: float = Field(ge=0)
-    allow_profit_reinvestment: bool = False
+    reinvest_profits: bool = True
+    monthly_contribution_usd: float = Field(200, ge=0)
+    informational_monthly_target_pct: float = Field(0.30, ge=0)
+    max_strategy_allocation_pct: float = Field(0.45, gt=0, le=1.0)
 
     @model_validator(mode="after")
     def _check_sum(self) -> CapitalConfig:
@@ -119,27 +129,28 @@ class CapitalConfig(BaseModel):
             raise ValueError(
                 f"allocations + reserve ({total}) exceed total capital ({self.total_capital_usd})"
             )
-        if self.allow_profit_reinvestment:
-            raise ValueError("automatic profit reinvestment is not allowed in this version")
         return self
 
 
 class RiskConfig(BaseModel):
-    leverage: float = 0
-    allow_margin: bool = False
-    allow_short: bool = False
-    max_risk_per_trade_pct: float = Field(0.01, gt=0, le=0.01)
-    min_risk_per_trade_pct: float = Field(0.005, gt=0, le=0.01)
-    max_daily_loss_pct: float = Field(0.02, gt=0, le=0.10)
-    max_drawdown_pct: float = Field(0.08, gt=0, le=0.25)
-    drawdown_warning_pct: float = Field(0.05, gt=0)
+    max_risk_per_trade_pct: float = Field(0.0075, gt=0, le=0.01)
+    max_total_open_risk_pct: float = Field(0.03, gt=0, le=0.06)
+    max_daily_loss_pct: float = Field(0.03, gt=0, le=0.10)
+    max_weekly_loss_pct: float = Field(0.06, gt=0, le=0.15)
+    drawdown_warning_pct: float = Field(0.10, gt=0)
+    drawdown_reduce_pct: float = Field(0.12, gt=0)
+    drawdown_live_lock_pct: float = Field(0.15, gt=0)
+    drawdown_emergency_pct: float = Field(0.20, gt=0, le=0.20)
+    reduced_activity_multiplier: float = Field(0.5, gt=0, le=1.0)
     max_total_exposure_pct: float = Field(0.60, gt=0, le=1.0)
-    max_order_notional_usd: float = Field(75, gt=0)
+    max_order_notional_usd: float = Field(120, gt=0)
     min_order_notional_usd: float = Field(5, ge=0)
     max_position_pct_of_strategy: float = Field(0.6, gt=0, le=1.0)
-    max_open_positions: int = Field(6, ge=1)
+    max_open_positions: int = Field(5, ge=1)
     max_open_orders: int = Field(30, ge=1)
-    max_correlated_exposure_pct: float = Field(0.30, gt=0, le=1.0)
+    max_correlated_exposure_pct: float = Field(0.35, gt=0, le=1.0)
+    correlation_threshold: float = Field(0.80, gt=0, le=1.0)
+    correlation_lookback_bars: int = Field(120, ge=20)
     max_price_age_seconds: dict[str, float] = Field(
         default_factory=lambda: {"crypto": 30, "stock": 180}
     )
@@ -149,20 +160,39 @@ class RiskConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check(self) -> RiskConfig:
-        if self.leverage != 0:
-            raise ValueError("leverage must be 0 (leverage is forbidden)")
-        if self.allow_margin:
-            raise ValueError("margin trading is forbidden")
-        if self.allow_short:
-            raise ValueError("short selling is forbidden")
-        if self.min_risk_per_trade_pct > self.max_risk_per_trade_pct:
-            raise ValueError("min_risk_per_trade_pct > max_risk_per_trade_pct")
-        if self.drawdown_warning_pct >= self.max_drawdown_pct:
-            raise ValueError("drawdown_warning_pct must be below max_drawdown_pct")
+        tiers = [self.drawdown_warning_pct, self.drawdown_reduce_pct, self.drawdown_live_lock_pct,
+                 self.drawdown_emergency_pct]
+        if tiers != sorted(tiers) or len(set(tiers)) != 4:
+            raise ValueError("drawdown tiers must be strictly increasing: warning < reduce < live_lock < emergency")
+        if self.max_daily_loss_pct > self.max_weekly_loss_pct:
+            raise ValueError("daily loss limit cannot exceed weekly loss limit")
+        if self.max_risk_per_trade_pct > self.max_total_open_risk_pct:
+            raise ValueError("risk per trade cannot exceed total open risk")
         return self
 
     def price_age_limit(self, asset_class: AssetClass) -> float:
         return float(self.max_price_age_seconds.get(asset_class.value, 30))
+
+
+class LeverageConfig(BaseModel):
+    enabled: bool = False
+    margin_mode: Literal["isolated"] = "isolated"
+    max_leverage: float = Field(1.5, ge=1.0)
+    symbols: list[str] = Field(default_factory=lambda: ["BTC/USDT", "ETH/USDT"])
+    venue: str = "crypto_perp"
+    maintenance_margin_rate: float = Field(0.005, gt=0, lt=0.1)
+    min_stop_to_liquidation_buffer_pct: float = Field(0.5, gt=0, le=0.95)
+    max_funding_rate_8h: float = Field(0.0005, ge=0)
+    required_live_days_without_leverage: int = Field(60, ge=60)
+
+    @model_validator(mode="after")
+    def _check(self) -> LeverageConfig:
+        if self.max_leverage > ABSOLUTE_MAX_LEVERAGE:
+            raise ValueError(f"max_leverage {self.max_leverage} exceeds absolute cap {ABSOLUTE_MAX_LEVERAGE}")
+        allowed = {"BTC/USDT", "ETH/USDT"}
+        if not set(self.symbols) <= allowed:
+            raise ValueError("leverage is allowed only for BTC/USDT and ETH/USDT")
+        return self
 
 
 class PaperSimulationConfig(BaseModel):
@@ -180,31 +210,9 @@ class PaperConfig(BaseModel):
     simulation: PaperSimulationConfig = PaperSimulationConfig()
 
 
-class GridParams(BaseModel):
-    levels: int = Field(3, ge=1, le=20)
-    level_notional_usd: float = Field(20, gt=0)
-    atr_period: int = 14
-    atr_spacing_multiplier: float = 0.6
-    min_spacing_pct: float = Field(0.006, gt=0)
-    max_spacing_pct: float = Field(0.03, gt=0)
-    max_inventory_usd_per_symbol: float = Field(60, gt=0)
-    stop_atr_multiplier: float = 2.0
-    stop_cooldown_minutes: float = 240
-    rebuild_drift_spacings: float = 1.5
-    rebuild_atr_change_pct: float = 0.35
-    max_order_age_minutes: float = 240
-    min_net_profit_usd: float = 0.05
-    min_net_profit_pct: float = 0.001
-    adverse_spread_buffer: float = 0.5
-
-    @model_validator(mode="after")
-    def _check(self) -> GridParams:
-        if self.min_spacing_pct >= self.max_spacing_pct:
-            raise ValueError("min_spacing_pct must be < max_spacing_pct")
-        return self
-
-
 class RegimeParams(BaseModel):
+    """Parameters of the deterministic market-regime classifier (used by the Market Analyzer)."""
+
     trend_period: int = 50
     adx_period: int = 14
     adx_trend_threshold: float = 25
@@ -214,16 +222,75 @@ class RegimeParams(BaseModel):
     allowed_regimes: list[str] = Field(default_factory=lambda: ["ranging", "bull"])
 
 
-class GridStrategyConfig(BaseModel):
+class MomentumIndicators(BaseModel):
+    ema_fast: int = 20
+    ema_mid: int = 50
+    ema_slow: int = 200
+    rsi_period: int = 14
+    macd_fast: int = 12
+    macd_slow: int = 26
+    macd_signal: int = 9
+    atr_period: int = 14
+    volume_lookback: int = 20
+    min_atr_pct: float = 0.004
+    max_atr_pct: float = 0.05
+
+    @model_validator(mode="after")
+    def _check(self) -> MomentumIndicators:
+        if not self.ema_fast < self.ema_mid < self.ema_slow:
+            raise ValueError("EMA periods must be fast < mid < slow")
+        if self.min_atr_pct >= self.max_atr_pct:
+            raise ValueError("min_atr_pct must be < max_atr_pct")
+        return self
+
+
+class MomentumParams(BaseModel):
     enabled: bool = True
-    strategy_id: str = "crypto_grid"
+    rsi_min: float = 52
+    rsi_max: float = 72
+    min_volume_ratio: float = 1.1
+    stop_atr_multiplier: float = 2.0
+    take_profit_r: float = 3.0
+    trailing_atr_multiplier: float = 2.5
+    trailing_activation_r: float = 1.0
+
+
+class BreakoutParams(BaseModel):
+    enabled: bool = True
+    lookback_bars: int = Field(20, ge=5)
+    min_volume_ratio: float = 1.5
+    min_close_position_in_range: float = Field(0.6, ge=0, le=1)
+    confirmation_bars: int = Field(1, ge=0, le=5)
+    max_extension_atr: float = 1.5
+    stop_atr_below_level: float = 1.0
+    take_profit_r: float = 2.5
+    trailing_atr_multiplier: float = 2.5
+    trailing_activation_r: float = 1.0
+
+
+class CryptoMomentumConfig(BaseModel):
+    enabled: bool = True
+    strategy_id: str = "crypto_momentum"
     venue: str = "crypto"
     symbols: list[str]
-    timeframe: str = "15m"
-    history_bars: int = 300
-    loop_interval_seconds: float = 30
-    grid: GridParams = GridParams()
-    regime: RegimeParams = RegimeParams()
+    timeframe: str = "1h"
+    history_bars: int = 400
+    loop_interval_seconds: float = 60
+    indicators: MomentumIndicators = MomentumIndicators()
+    momentum: MomentumParams = MomentumParams()
+    breakout: BreakoutParams = BreakoutParams()
+    entry_limit_offset_bps: float = 10
+    max_spread_bps: float = 15
+    cooldown_bars_after_exit: int = 3
+
+
+class StockBreakoutParams(BaseModel):
+    enabled: bool = True
+    lookback_bars: int = Field(55, ge=10)
+    min_volume_ratio: float = 1.3
+    stop_atr_below_level: float = 1.0
+    take_profit_r: float = 2.5
+    max_extension_atr: float = 1.0
 
 
 class StockTrendConfig(BaseModel):
@@ -252,6 +319,7 @@ class StockTrendConfig(BaseModel):
     entry_limit_offset_bps: float = 10
     max_spread_bps: float = 20
     allow_fractional: bool = True
+    breakout: StockBreakoutParams = StockBreakoutParams()
 
     @model_validator(mode="after")
     def _check(self) -> StockTrendConfig:
@@ -276,20 +344,21 @@ class ArbitrageConfig(BaseModel):
     slippage_bps: float = 5
     max_quote_age_ms: float = 3000
     max_clock_skew_ms: float = 2000
+    max_fetch_latency_ms: float = 1500
     assumed_latency_ms: float = 500
     max_execution_risk_usd: float = 0.5
     volatility_per_second_bps: float = 2.0
     transfer_amortization_trades: int = Field(10, ge=1)
     transfer_fees: dict[str, float] = Field(default_factory=dict)
     taker_fees: dict[str, float] = Field(default_factory=lambda: {"default": 0.001})
-    virtual_capital_usd: float = 200
+    virtual_capital_usd: float = 1800
 
     def taker_fee(self, exchange: str) -> float:
         return float(self.taker_fees.get(exchange, self.taker_fees.get("default", 0.001)))
 
 
 class StrategiesConfig(BaseModel):
-    crypto_grid: GridStrategyConfig
+    crypto_momentum: CryptoMomentumConfig
     stock_trend: StockTrendConfig
     arbitrage: ArbitrageConfig
 
@@ -345,6 +414,7 @@ class InstrumentsFile(BaseModel):
 class AppConfig(BaseModel):
     capital: CapitalConfig
     risk: RiskConfig
+    leverage: LeverageConfig = LeverageConfig()
     paper: PaperConfig
     strategies: StrategiesConfig
     instruments: dict[str, InstrumentConfig]
@@ -360,15 +430,12 @@ class AppConfig(BaseModel):
 
     @model_validator(mode="after")
     def _cross_check(self) -> AppConfig:
-        for sym in self.strategies.crypto_grid.symbols + self.strategies.stock_trend.symbols:
+        for sym in self.strategies.crypto_momentum.symbols + self.strategies.stock_trend.symbols:
             if sym not in self.instruments:
                 raise ValueError(f"strategy symbol {sym} missing from instruments.yaml")
-        grid = self.strategies.crypto_grid
-        budget = self.capital.allocations.get(grid.strategy_id, 0)
-        if grid.enabled and budget > 0:
-            per_symbol = budget / max(len(grid.symbols), 1)
-            if grid.grid.max_inventory_usd_per_symbol > per_symbol + 1e-9:
-                raise ValueError("grid max_inventory_usd_per_symbol exceeds per-symbol budget")
+        for sid, amount in self.capital.allocations.items():
+            if amount > self.capital.max_strategy_allocation_pct * self.capital.total_capital_usd + 1e-9:
+                raise ValueError(f"initial allocation of {sid} exceeds max_strategy_allocation_pct")
         return self
 
     def correlation_group(self, symbol: str) -> str:
@@ -394,6 +461,7 @@ def load_app_config(config_dir: Path | None = None) -> AppConfig:
     return AppConfig(
         capital=CapitalConfig.model_validate(strat["capital"]),
         risk=RiskConfig.model_validate(strat["risk"]),
+        leverage=LeverageConfig.model_validate(strat.get("leverage", {})),
         paper=PaperConfig.model_validate(strat.get("paper", {})),
         strategies=StrategiesConfig.model_validate(strat["strategies"]),
         instruments=inst.instruments,

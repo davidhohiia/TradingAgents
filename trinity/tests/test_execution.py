@@ -36,7 +36,7 @@ async def book(system, symbol="BTC/USDT"):
 async def buy_intent(system, qty=0.0003, order_type=OrderType.MARKET, price=None, stop_frac=0.97, **kw):
     b = await book(system)
     ref = b.best_ask
-    return OrderIntent(strategy_id="crypto_grid", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
+    return OrderIntent(strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
                        order_type=order_type, quantity=qty, reference_price=ref, market_data_ts=b.ts,
                        asset_class=AssetClass.CRYPTO, price=price,
                        stop_price=(price or ref) * stop_frac, **kw)
@@ -44,7 +44,7 @@ async def buy_intent(system, qty=0.0003, order_type=OrderType.MARKET, price=None
 
 async def sell_intent(system, qty, order_type=OrderType.MARKET, price=None, **kw):
     b = await book(system)
-    return OrderIntent(strategy_id="crypto_grid", venue="crypto", symbol="BTC/USDT", side=Side.SELL,
+    return OrderIntent(strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.SELL,
                        order_type=order_type, quantity=qty, reference_price=b.best_bid, market_data_ts=b.ts,
                        asset_class=AssetClass.CRYPTO, price=price, **kw)
 
@@ -56,7 +56,7 @@ async def test_market_buy_fills_with_fees_and_updates_position(system):
     o = system.repo.get_order(res.client_order_id)
     assert o.status == OrderStatus.FILLED and o.filled_quantity == pytest.approx(0.0003)
     assert o.fee_usd == pytest.approx(0.0003 * o.avg_fill_price * 0.001, rel=1e-6)
-    pos = system.positions.get("crypto_grid", "crypto", "BTC/USDT")
+    pos = system.positions.get("crypto_momentum", "crypto", "BTC/USDT")
     assert pos.quantity == pytest.approx(0.0003)
     # cost basis includes fee
     assert pos.cost_basis == pytest.approx(0.0003 * o.avg_fill_price + o.fee_usd)
@@ -74,7 +74,7 @@ async def test_round_trip_records_trade_with_net_pnl(system):
     t = trades[0]
     # buying at ask and selling at bid with fees must lose money
     assert t["realized_pnl"] < 0 and t["exit_reason"] == "test exit"
-    assert not system.positions.get("crypto_grid", "crypto", "BTC/USDT").is_open
+    assert not system.positions.get("crypto_momentum", "crypto", "BTC/USDT").is_open
 
 
 async def test_market_order_partial_fill_when_depth_insufficient(tmp_path, config):
@@ -85,7 +85,7 @@ async def test_market_order_partial_fill_when_depth_insufficient(tmp_path, confi
     o = s.repo.get_order(res.client_order_id)
     assert o.status == OrderStatus.CANCELED  # IOC remainder canceled
     assert 0 < o.filled_quantity < 0.001
-    assert s.positions.get("crypto_grid", "crypto", "BTC/USDT").quantity == pytest.approx(o.filled_quantity)
+    assert s.positions.get("crypto_momentum", "crypto", "BTC/USDT").quantity == pytest.approx(o.filled_quantity)
 
 
 # ---------------------------------------------------------------- limit orders & partial fills
@@ -111,7 +111,7 @@ async def test_limit_order_rests_then_partially_then_fully_fills(system):
     assert o.status == OrderStatus.FILLED and o.filled_quantity == pytest.approx(0.0003)
     assert o.reserved_usd == 0
     assert len(system.repo.list_executions()) == 2
-    assert system.positions.get("crypto_grid", "crypto", "BTC/USDT").quantity == pytest.approx(0.0003)
+    assert system.positions.get("crypto_momentum", "crypto", "BTC/USDT").quantity == pytest.approx(0.0003)
 
 
 async def test_cancel_releases_locked_funds(system):
@@ -181,7 +181,7 @@ async def test_fill_processing_is_idempotent(system):
     for _ in range(3):
         await system.engine._apply_update(rec, ex)  # same venue state re-applied
     assert len(system.repo.list_executions()) == 1
-    assert system.positions.get("crypto_grid", "crypto", "BTC/USDT").quantity == pytest.approx(0.0003)
+    assert system.positions.get("crypto_momentum", "crypto", "BTC/USDT").quantity == pytest.approx(0.0003)
 
 
 async def test_self_trade_between_strategies_rejected(system):
@@ -355,7 +355,7 @@ async def make_live_engine(tmp_path: Path, config, fake: FakeCCXT):
 async def test_integration_simulated_exchange_partial_fills_live_path(tmp_path, config):
     fake = FakeCCXT()
     engine, clock = await make_live_engine(tmp_path, config, fake)
-    i = OrderIntent(strategy_id="crypto_grid", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
+    i = OrderIntent(strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
                     order_type=OrderType.LIMIT, quantity=0.0004, reference_price=60010.0, price=59500.0,
                     stop_price=57000.0, market_data_ts=clock.now(), asset_class=AssetClass.CRYPTO)
     res = await engine.submit(i)
@@ -369,7 +369,7 @@ async def test_integration_simulated_exchange_partial_fills_live_path(tmp_path, 
     assert o.status == OrderStatus.FILLED and o.mode == Mode.LIVE
     assert len(engine.repo.list_executions(Mode.LIVE)) == 2
     assert o.fee_usd == pytest.approx(0.0004 * 59500 * 0.001)
-    pos = engine.positions.get("crypto_grid", "crypto", "BTC/USDT")
+    pos = engine.positions.get("crypto_momentum", "crypto", "BTC/USDT")
     assert pos.quantity == pytest.approx(0.0004)
     rep = await engine.reconcile("crypto")
     assert rep.ok, rep.issues
@@ -426,7 +426,7 @@ async def test_fee_charged_in_base_currency_credits_net_quantity(system):
                        OrderStatus.FILLED, rec.quantity, rec.quantity, rec.price, rec.price,
                        fee=rec.quantity * 0.001, fee_currency="BTC")
     await system.engine._apply_update(rec, ex)
-    pos = system.positions.get("crypto_grid", "crypto", "BTC/USDT")
+    pos = system.positions.get("crypto_momentum", "crypto", "BTC/USDT")
     assert pos.quantity == pytest.approx(rec.quantity * 0.999)
     assert pos.cost_basis == pytest.approx(rec.quantity * rec.price, rel=1e-6)
 

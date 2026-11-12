@@ -293,3 +293,131 @@ def _has_key(method: str) -> str:
     """fetch_open_orders -> fetchOpenOrders (CCXT 'has' keys)."""
     head, *rest = method.split("_")
     return head + "".join(p.capitalize() for p in rest)
+
+
+class CCXTDerivativesExchange(CCXTExchange):
+    """USDT-margined linear perpetuals, ISOLATED margin, long-only use by TRINITY.
+
+    Only instantiated when the LeverageGuard has granted permission (never by default).
+    Logical symbols stay "BTC/USDT"; the adapter maps them to CCXT perp symbols
+    ("BTC/USDT:USDT") and converts base quantity <-> contracts via contractSize.
+    Unified CCXT methods used: set_margin_mode, set_leverage, fetch_funding_rate,
+    fetch_positions. Verify each exchange's behaviour in its official documentation.
+    NOT verified against a real exchange from the development environment.
+    """
+
+    def __init__(self, exchange_id: str, *, allowed_symbols: list[str], **kwargs: Any) -> None:
+        client = kwargs.pop("client", None)
+        super().__init__(exchange_id, client=client, **kwargs)
+        if client is None:
+            self.client.options["defaultType"] = "swap"
+        self.allowed = set(allowed_symbols)
+        self._contract_size: dict[str, float] = {}
+        self._leverage_set: dict[str, float] = {}
+
+    @staticmethod
+    def perp(symbol: str) -> str:
+        base, quote = symbol.split("/")
+        return f"{base}/{quote}:{quote}"
+
+    async def connect(self) -> None:
+        markets = await self._call("load_markets", self.client.load_markets)
+        import ccxt
+
+        tick_mode = getattr(self.client, "precisionMode", None) == ccxt.TICK_SIZE
+        for logical in self.allowed:
+            m = markets.get(self.perp(logical))
+            if not m or not m.get("swap") or not m.get("linear", True):
+                continue
+            cs = float(m.get("contractSize") or 1.0)
+            self._contract_size[logical] = cs
+            prec = m.get("precision") or {}
+
+            def step(p: Any) -> float:
+                if p is None:
+                    return 1e-8
+                return float(p) if tick_mode else 10 ** (-float(p))
+
+            limits = m.get("limits") or {}
+            self._markets[logical] = MarketInfo(
+                symbol=logical, base=m["base"], quote=m["quote"], asset_class=AssetClass.CRYPTO,
+                qty_step=step(prec.get("amount")) * cs, price_step=step(prec.get("price")),
+                min_qty=float((limits.get("amount") or {}).get("min") or 0.0) * cs,
+                min_notional=float((limits.get("cost") or {}).get("min") or 0.0),
+                maker_fee=float(m.get("maker") or 0.0005), taker_fee=float(m.get("taker") or 0.0005),
+                fractional=True, active=bool(m.get("active", True)),
+            )
+
+    def _check_symbol(self, symbol: str) -> None:
+        if symbol not in self.allowed:
+            raise OrderRejected(f"{symbol} not allowed for leverage")
+
+    async def prepare_leverage(self, symbol: str, leverage: float) -> None:
+        from trinity.config.settings import ABSOLUTE_MAX_LEVERAGE
+
+        self._require_keys()
+        self._check_symbol(symbol)
+        if leverage > ABSOLUTE_MAX_LEVERAGE or leverage < 1:
+            raise OrderRejected(f"leverage {leverage} outside [1, {ABSOLUTE_MAX_LEVERAGE}]")
+        perp = self.perp(symbol)
+        await self._call("set_margin_mode", self.client.set_margin_mode, "isolated", perp, retries=2)
+        await self._call("set_leverage", self.client.set_leverage, leverage, perp, retries=2)
+        self._leverage_set[symbol] = leverage
+
+    async def fetch_funding_rate(self, symbol: str) -> float:
+        self._check_symbol(symbol)
+        fr = await self._call("fetch_funding_rate", self.client.fetch_funding_rate, self.perp(symbol))
+        rate = float(fr.get("fundingRate") or 0.0)
+        interval = str(fr.get("interval") or "8h")
+        hours = float(interval[:-1]) if interval.endswith("h") and interval[:-1].replace(".", "").isdigit() else 8.0
+        return rate * 8.0 / hours  # normalized to an 8h period
+
+    def _contracts(self, symbol: str, qty: float) -> float:
+        return qty / self._contract_size.get(symbol, 1.0)
+
+    async def create_order(self, req: OrderRequest) -> ExchangeOrder:
+        self._require_keys()
+        self._check_symbol(req.symbol)
+        if req.symbol not in self._leverage_set:
+            raise OrderRejected("isolated leverage must be prepared before the first order")
+        params = {"clientOrderId": req.client_order_id, "marginMode": "isolated"}
+        if req.side == Side.SELL:
+            params["reduceOnly"] = True  # TRINITY never opens shorts
+        o = await self._call("create_order", self.client.create_order, self.perp(req.symbol), req.order_type.value,
+                             req.side.value, self._contracts(req.symbol, req.quantity), req.price, params, retries=1)
+        return self._from_contracts(req.symbol, o, req.client_order_id)
+
+    def _from_contracts(self, symbol: str, o: dict[str, Any], cid: str | None = None) -> ExchangeOrder:
+        res = self._to_order(o)
+        cs = self._contract_size.get(symbol, 1.0)
+        res.symbol = symbol
+        res.quantity *= cs
+        res.filled *= cs
+        res.client_order_id = res.client_order_id or cid
+        return res
+
+    async def fetch_order(self, symbol: str, exchange_order_id: str | None, client_order_id: str | None) -> ExchangeOrder | None:
+        self._require_keys()
+        if not exchange_order_id:
+            return None
+        try:
+            o = await self._call("fetch_order", self.client.fetch_order, exchange_order_id, self.perp(symbol))
+        except OrderNotFound:
+            return None
+        return self._from_contracts(symbol, o)
+
+    async def fetch_positions(self) -> dict[str, tuple[float, float]]:
+        self._require_keys()
+        rows = await self._call("fetch_positions", self.client.fetch_positions, [self.perp(s) for s in self.allowed])
+        out = {}
+        for r in rows:
+            sym = str(r.get("symbol", "")).split(":")[0]
+            contracts = float(r.get("contracts") or 0.0)
+            if contracts and sym in self.allowed:
+                out[sym] = (contracts * float(r.get("contractSize") or self._contract_size.get(sym, 1.0)),
+                            float(r.get("entryPrice") or 0.0))
+        return out
+
+    def capabilities(self) -> dict[str, Any]:
+        return {"client_order_id": True, "margin_mode": "isolated", "max_leverage": 2.0, "long_only": True,
+                "paper": False, "withdrawals": False}

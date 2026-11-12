@@ -100,3 +100,15 @@ def round_to_step(value: float, step: float) -> float:
     n = round(value / step)
     decimals = max(0, -int(math.floor(math.log10(step)))) if step < 1 else 0
     return round(n * step, decimals + 2)
+
+
+def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
+    line = close.ewm(span=fast, adjust=False, min_periods=fast).mean() - close.ewm(
+        span=slow, adjust=False, min_periods=slow).mean()
+    sig = line.ewm(span=signal, adjust=False, min_periods=signal).mean()
+    return pd.DataFrame({"macd": line, "macd_signal": sig, "macd_hist": line - sig})
+
+
+def rolling_high(series: pd.Series, window: int) -> pd.Series:
+    """Highest value of the PREVIOUS ``window`` bars (excludes the current bar: no look-ahead)."""
+    return series.shift(1).rolling(window, min_periods=window).max()

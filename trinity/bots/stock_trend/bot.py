@@ -14,6 +14,7 @@ from typing import Any
 
 from trinity.ai.anomaly_detector import AnomalyDetector
 from trinity.bots.base import BaseBot
+from trinity.bots.stock_trend.breakout import evaluate_breakout_entry
 from trinity.bots.stock_trend.signals import compute_signals
 from trinity.bots.stock_trend.strategy import PositionState, StockTrendStrategy
 from trinity.config.settings import AppConfig, StockTrendConfig
@@ -127,7 +128,7 @@ class StockTrendBot(BaseBot):
                         strategy_id=self.strategy_id, venue=self.gateway.venue, symbol=symbol, side=Side.SELL,
                         order_type=OrderType.MARKET, quantity=qty, reference_price=bid, market_data_ts=book.ts,
                         asset_class=AssetClass.STOCK, reduce_only=True, protective_exit=dec.protective,
-                        reason=dec.reason))
+                        reason=dec.reason, sub_strategy=pos.sub_strategy))
                     info["exit"] = {"reason": dec.reason, "accepted": res.accepted, "why": res.reasons}
                 continue
             if locks or self.paused:
@@ -143,22 +144,24 @@ class StockTrendBot(BaseBot):
                 info["entry"] = "entry order pending"
                 continue
             inst = self.app.instruments[symbol]
-            dec = self.strategy.evaluate_entry(
-                sig, bid=bid, ask=ask, market=market, strategy_capital=cap.effective_capital,
-                risk_pct=self.gateway.max_risk_per_trade_pct, available_cash=cap.available,
-                max_order_notional=self.app.risk.max_order_notional_usd,
-                max_position_notional=self.app.risk.max_position_pct_of_strategy * cap.effective_capital,
-                sell_fee_pct=inst.sell_regulatory_fee_pct,
-            )
-            info["entry"] = dec.reasons
+            # risk budget = 0.75% of account equity (x0.5 in the 12% drawdown tier) - set by the Risk Manager
+            max_risk = self.gateway.max_trade_risk_usd()
+            common = dict(bid=bid, ask=ask, market=market, strategy_capital=max_risk, risk_pct=1.0,
+                          available_cash=cap.available, max_order_notional=self.app.risk.max_order_notional_usd,
+                          max_position_notional=self.app.risk.max_position_pct_of_strategy * cap.effective_capital)
+            trend = self.strategy.evaluate_entry(sig, sell_fee_pct=inst.sell_regulatory_fee_pct, **common)
+            brk = evaluate_breakout_entry(df, sig, self.cfg, **common)
+            dec, sub = (trend, "trend") if trend.enter else (brk, "breakout")
+            info["entry"] = {"trend": trend.reasons, "breakout": brk.reasons}
             if not dec.enter or dec.sizing is None:
                 continue
             res = await self.gateway.submit(OrderIntent(
                 strategy_id=self.strategy_id, venue=self.gateway.venue, symbol=symbol, side=Side.BUY,
                 order_type=OrderType.LIMIT, quantity=dec.sizing.quantity, reference_price=ask,
                 market_data_ts=book.ts, asset_class=AssetClass.STOCK, price=dec.entry_price,
-                stop_price=dec.stop, take_profit=dec.take_profit, reason="; ".join(dec.reasons)))
-            info["submitted"] = {"accepted": res.accepted, "why": res.reasons}
+                stop_price=dec.stop, take_profit=dec.take_profit, reason=f"{sub}: " + "; ".join(dec.reasons),
+                sub_strategy=sub))
+            info["submitted"] = {"accepted": res.accepted, "why": res.reasons, "strategy": sub}
             if res.accepted:
                 open_syms.append(symbol)
         self._persist()

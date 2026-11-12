@@ -1,18 +1,21 @@
 """Capital allocator.
 
-The database (positions + active orders) is the source of truth, so the allocation
-is always reconstructed correctly after a crash. Rules:
+The database (positions + active orders + current allocations) is the source of truth,
+so the allocation is reconstructed exactly after a crash. Rules:
 
-* Each strategy can only use its own allocation. The reserve is never allocated.
-* Realized losses REDUCE the usable capital; realized profits do NOT increase it
-  (no automatic growth of trading capital).
-* A client order id can hold only one reservation (no double allocation).
-* Available capital can never become negative: reservations that do not fit are refused.
+* each strategy can only use its own allocation; the reserve is never allocated here;
+* reinvestment: with ``reinvest_profits`` (default in 3.0) realized profits AND losses
+  change the strategy capital (compounding). Without it only losses reduce capital;
+* a client order id can hold only one reservation (no double allocation);
+* available capital never becomes negative;
+* leveraged positions tie up margin (cost / leverage), never more than allowed by the
+  LeverageGuard, which is disabled by default.
 """
 
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from trinity.config.settings import AppConfig
@@ -31,20 +34,31 @@ class StrategyCapital:
 
 
 class CapitalAllocator:
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, allocation_fn: Callable[[str], float] | None = None,
+                 all_allocations_fn: Callable[[], dict[str, float]] | None = None) -> None:
         self.config = config
+        self._allocation_fn = allocation_fn
+        self._all_fn = all_allocations_fn
         self._lock = threading.Lock()
         self._inflight: dict[str, tuple[str, float]] = {}
 
-    @property
-    def reserve_usd(self) -> float:
-        return self.config.capital.reserve_usd
-
     def allocation(self, strategy_id: str) -> float:
+        if self._allocation_fn is not None:
+            return float(self._allocation_fn(strategy_id))
         return self.config.allocation(strategy_id)
 
+    def strategies(self) -> list[str]:
+        if self._all_fn is not None:
+            return list(self._all_fn())
+        return list(self.config.capital.allocations)
+
     def effective_capital(self, strategy_id: str, realized_pnl: float) -> float:
-        return max(self.allocation(strategy_id) + min(realized_pnl, 0.0), 0.0)
+        alloc = self.allocation(strategy_id)
+        if alloc <= 0:
+            return 0.0  # unfunded strategies (arbitrage) never trade, even with "profits"
+        if self.config.capital.reinvest_profits:
+            return max(alloc + realized_pnl, 0.0)
+        return max(alloc + min(realized_pnl, 0.0), 0.0)
 
     def compute(
         self,
@@ -55,7 +69,7 @@ class CapitalAllocator:
         fee_rate_of: dict[str, float] | None = None,
     ) -> StrategyCapital:
         fee_rate_of = fee_rate_of or {}
-        deployed = sum(p.cost_basis for p in positions if p.strategy_id == strategy_id and p.is_open)
+        deployed = sum(p.margin_used for p in positions if p.strategy_id == strategy_id and p.is_open)
         reserved = 0.0
         db_ids = set()
         for o in active_orders:
@@ -63,7 +77,7 @@ class CapitalAllocator:
                 continue
             db_ids.add(o.client_order_id)
             price = o.price if o.price is not None else (o.avg_fill_price or 0.0)
-            reserved += o.remaining * price * (1 + fee_rate_of.get(o.symbol, 0.0))
+            reserved += o.remaining * price * (1 + fee_rate_of.get(o.symbol, 0.0)) / max(o.leverage, 1.0)
         with self._lock:
             reserved += sum(
                 amt for cid, (sid, amt) in self._inflight.items() if sid == strategy_id and cid not in db_ids
@@ -96,5 +110,5 @@ class CapitalAllocator:
     ) -> dict[str, StrategyCapital]:
         return {
             sid: self.compute(sid, positions, active_orders, realized.get(sid, 0.0))
-            for sid in self.config.capital.allocations
+            for sid in self.strategies()
         }

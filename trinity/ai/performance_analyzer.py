@@ -11,6 +11,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
+import pandas as pd
+
 from trinity.core.models import Mode
 from trinity.database.repository import Repository
 
@@ -103,3 +105,73 @@ class PerformanceAnalyzer:
         if not recs:
             recs.append(Recommendation(strategy_id, "No change recommended.", {}))
         return recs
+
+
+# ---------------------------------------------------------------------- TRINITY 3.0 extensions
+def _stats_dict(s: dict[str, float]) -> dict[str, float | int | None]:
+    n = int(s["n"] or 0)
+    pf = (s["gross_win"] / s["gross_loss"]) if s["gross_loss"] else (math.inf if s["gross_win"] else None)
+    return {"trades": n, "net_pnl": float(s["pnl"]), "fees": float(s["fees"]),
+            "win_rate": (s["wins"] / n) if n else None, "profit_factor": pf,
+            "avg_trade": (s["pnl"] / n) if n else None}
+
+
+class StrategyAnalytics(PerformanceAnalyzer):
+    """Per-(sub)strategy statistics, real-vs-virtual control, strategy correlation, degradation."""
+
+    SUBS = {"crypto_momentum": ["momentum", "breakout"], "stock_trend": ["trend", "breakout"]}
+
+    def per_sub_strategy(self, mode: Mode) -> dict[str, dict[str, float | int | None]]:
+        out = {}
+        for sid, subs in self.SUBS.items():
+            out[sid] = _stats_dict(self.repo.trade_stats(mode, sid))
+            for sub in subs:
+                out[f"{sid}.{sub}"] = _stats_dict(self.repo.trade_stats(mode, sid, sub_strategy=sub))
+        return out
+
+    def real_vs_virtual(self, strategy_id: str) -> dict[str, Any]:
+        paper = _stats_dict(self.repo.trade_stats(Mode.PAPER, strategy_id))
+        live = _stats_dict(self.repo.trade_stats(Mode.LIVE, strategy_id))
+        flags = []
+        if live["trades"] and live["trades"] >= self.MIN_SAMPLE and paper["trades"] >= self.MIN_SAMPLE:
+            if paper["avg_trade"] and live["avg_trade"] is not None and live["avg_trade"] < paper["avg_trade"] * 0.5:
+                flags.append("live average trade below 50% of paper: check slippage/fees/latency")
+            if paper["win_rate"] and live["win_rate"] is not None and live["win_rate"] < paper["win_rate"] - 0.15:
+                flags.append("live win rate >15pp below paper")
+        elif live["trades"]:
+            flags.append(f"only {live['trades']} live trades: comparison not yet meaningful")
+        return {"strategy": strategy_id, "paper_virtual": paper, "live_real": live, "flags": flags}
+
+    def daily_pnl(self, mode: Mode) -> dict[str, pd.Series]:
+        rows = self.repo.query("SELECT strategy_id, substr(exit_time,1,10) d, SUM(realized_pnl) p FROM trades "
+                               "WHERE mode=? GROUP BY strategy_id, d", (mode.value,))
+        series: dict[str, dict[str, float]] = {}
+        for r in rows:
+            series.setdefault(r["strategy_id"], {})[r["d"]] = float(r["p"])
+        return {k: pd.Series(v) for k, v in series.items()}
+
+    def strategy_correlations(self, mode: Mode) -> dict[str, float]:
+        from trinity.risk.correlation import strategy_correlation
+
+        return {f"{a}~{b}": v for (a, b), v in strategy_correlation(self.daily_pnl(mode)).items()}
+
+    def degradation_report(self, mode: Mode, window: int = 20) -> dict[str, list[str]]:
+        out: dict[str, list[str]] = {}
+        for sid, subs in self.SUBS.items():
+            for key, sub in [(sid, None)] + [(f"{sid}.{s}", s) for s in subs]:
+                rows = [r for r in self.repo.list_trades(mode, limit=1000, strategy_id=sid)
+                        if sub is None or r["sub_strategy"] == sub][: window * 2]
+                if len(rows) < window * 2:
+                    continue
+                recent = [r["realized_pnl"] for r in rows[:window]]
+                older = [r["realized_pnl"] for r in rows[window:]]
+                notes = []
+                if sum(recent) < 0 <= sum(older):
+                    notes.append(f"last {window} trades net {sum(recent):.2f} vs previous {sum(older):.2f}")
+                wr_r = sum(1 for x in recent if x > 0) / window
+                wr_o = sum(1 for x in older if x > 0) / window
+                if wr_r < wr_o - 0.2:
+                    notes.append(f"win rate {wr_o:.0%} -> {wr_r:.0%}")
+                if notes:
+                    out[key] = notes
+        return out

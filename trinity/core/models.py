@@ -192,6 +192,8 @@ class OrderIntent:
     reason: str = ""
     parent_client_order_id: str | None = None
     client_order_id: str = ""
+    sub_strategy: str = ""  # e.g. "momentum" / "breakout" (separate statistics)
+    leverage: float = 1.0  # 1.0 = spot. >1 only via the LeverageGuard (disabled by default)
     tags: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -268,6 +270,8 @@ class OrderRecord:
     error: str | None = None
     created_at: datetime = field(default_factory=utcnow)
     updated_at: datetime = field(default_factory=utcnow)
+    sub_strategy: str = ""
+    leverage: float = 1.0
 
     @property
     def remaining(self) -> float:
@@ -311,6 +315,25 @@ class Position:
     updated_at: datetime = field(default_factory=utcnow)
     correlation_group: str = ""
     asset_class: AssetClass = AssetClass.CRYPTO
+    sub_strategy: str = ""
+    leverage: float = 1.0
+    liquidation_price: float | None = None
+    funding_paid: float = 0.0
+
+    @property
+    def margin_used(self) -> float:
+        """Capital tied up: full cost for spot, cost / leverage for isolated margin."""
+        return self.cost_basis / max(self.leverage, 1.0)
+
+    @property
+    def risk_to_stop(self) -> float:
+        """Capital lost if the protective stop is hit (vs entry). A stop at/above entry = 0 risk.
+        Without a stop the whole cost basis is treated as at risk."""
+        if not self.is_open:
+            return 0.0
+        if self.stop_price is None or self.stop_price <= 0:
+            return self.cost_basis
+        return max(self.avg_entry_price - self.stop_price, 0.0) * self.quantity
 
     @property
     def is_open(self) -> bool:

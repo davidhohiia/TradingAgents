@@ -10,7 +10,7 @@ import pytest
 
 from trinity.backtesting.engine import BacktestConfig, BacktestEngine, BarContext, BtOrder
 from trinity.backtesting.metrics import compute_metrics, max_drawdown
-from trinity.backtesting.strategies import GridBacktest, TrendBacktest
+from trinity.backtesting.strategies import MomentumBacktest, TrendBacktest
 from trinity.backtesting.walk_forward import chronological_split, optimize_holdout, walk_forward
 
 
@@ -113,38 +113,73 @@ def _grid_df(n=900, seed=5):
     return bars(closes, volume=5.0, wick=0.003)
 
 
-def test_grid_backtest_runs_with_same_strategy_code(config):
-    df = _grid_df()
+def _trend_df(n=900, seed=5):
+    rng = np.random.default_rng(seed)
+    closes = 60000 * np.exp(np.cumsum(0.0006 + rng.normal(0, 0.008, n)))
+    vol = rng.uniform(50, 200, n)
+    return bars(closes, volume=vol, wick=0.004).set_axis(pd.date_range("2026-01-01", periods=n, freq="h", tz="UTC"))
+
+
+def _mom_bt(config, m):
+    return cfg(initial_cash=150, maker_fee=0.001, taker_fee=0.001, qty_step=m.qty_step, min_notional=5,
+               participation_rate=0.5, lookback_bars=300, periods_per_year=365 * 24)
+
+
+def test_momentum_backtest_runs_with_same_strategy_code(config):
+    df = _trend_df()
     m = config.instruments["BTC/USDT"].to_market_info("BTC/USDT")
-    bt = cfg(initial_cash=150, maker_fee=0.001, taker_fee=0.001, qty_step=m.qty_step, min_notional=5,
-             participation_rate=0.05, lookback_bars=300)
-    res = BacktestEngine(bt).run(df, GridBacktest(config.strategies.crypto_grid, m, 150, 0.01), start_index=80)
-    assert res.metrics.trades >= 0 and math.isfinite(res.metrics.net_return)
+    strat = MomentumBacktest(config.strategies.crypto_momentum, m, 3.75, 120)
+    res = BacktestEngine(_mom_bt(config, m)).run(df, strat, start_index=210)
+    assert res.metrics.trades >= 1 and math.isfinite(res.metrics.net_return)
+    assert sum(strat.trades_by_strategy.values()) >= 1
     buys = [f for f in res.fills if f.side == "buy"]
-    assert all(f.qty * f.price <= 20.0 + 1e-6 for f in buys)  # fixed level size
-    assert res.metrics.total_fees >= 0
+    assert all(f.qty * f.price <= 120 + 1e-6 for f in buys)  # max order notional respected
+
+
+def test_no_future_data_leakage_in_momentum_strategy(config):
+    from trinity.backtesting.lookahead_check import check_backtest_causality, check_feature_causality
+    from trinity.bots.crypto_momentum.signals import compute_features
+
+    df = _trend_df(600)
+    ind = config.strategies.crypto_momentum.indicators
+    rep = check_feature_causality(df, lambda d: compute_features(d, ind)[
+        ["ema_fast", "ema_mid", "ema_slow", "rsi", "macd_hist", "atr", "vol_ratio"]], min_bars=220)
+    assert rep.ok, rep.violations
+    m = config.instruments["BTC/USDT"].to_market_info("BTC/USDT")
+    rep2 = check_backtest_causality(
+        df, lambda: MomentumBacktest(config.strategies.crypto_momentum, m, 3.75, 120), _mom_bt(config, m), 210)
+    assert rep2.ok, rep2.violations
+
+
+def test_lookahead_checker_detects_a_leaky_feature():
+    from trinity.backtesting.lookahead_check import check_feature_causality
+
+    df = _trend_df(200)
+    leaky = check_feature_causality(df, lambda d: d["close"].shift(-1), min_bars=20)  # uses tomorrow's close
+    assert not leaky.ok and leaky.violations
+    centered = check_feature_causality(df, lambda d: d["close"].rolling(5, center=True).mean(), min_bars=20)
+    assert not centered.ok
 
 
 def test_holdout_and_walk_forward_never_test_on_training_data(config):
-    df = _grid_df(700)
+    df = _trend_df(800)
     m = config.instruments["BTC/USDT"].to_market_info("BTC/USDT")
-    bt = cfg(initial_cash=150, maker_fee=0.001, taker_fee=0.001, qty_step=m.qty_step, min_notional=5,
-             participation_rate=0.05, lookback_bars=200)
+    bt = _mom_bt(config, m)
 
     def factory(params):
-        c = config.strategies.crypto_grid.model_copy(deep=True)
-        c.grid.atr_spacing_multiplier = params["k"]
-        return GridBacktest(c, m, 150, 0.01)
+        c = config.strategies.crypto_momentum.model_copy(deep=True)
+        c.momentum.stop_atr_multiplier = params["k"]
+        return MomentumBacktest(c, m, 3.75, 120)
 
-    split = chronological_split(len(df), warmup=80)
-    res = optimize_holdout(df, factory, {"k": [0.5, 1.0]}, bt, split, min_trades=1)
-    assert res.best_params["k"] in (0.5, 1.0)
-    folds = walk_forward(df, factory, {"k": [0.5, 1.0]}, bt, warmup=80, train_bars=250, test_bars=120, min_trades=1)
+    split = chronological_split(len(df), warmup=210)
+    res = optimize_holdout(df, factory, {"k": [1.5, 2.5]}, bt, split, min_trades=1)
+    assert res.best_params["k"] in (1.5, 2.5)
+    folds = walk_forward(df, factory, {"k": [1.5, 2.5]}, bt, warmup=210, train_bars=250, test_bars=150, min_trades=1)
     assert folds
     for f in folds:
-        assert f.test[0] >= f.train[1]  # out-of-sample strictly after training
+        assert f.test[0] >= f.train[1]
     tests = [f.test for f in folds]
-    assert all(a[1] <= b[0] for a, b in zip(tests, tests[1:], strict=False))  # non-overlapping
+    assert all(a[1] <= b[0] for a, b in zip(tests, tests[1:], strict=False))
 
 
 def test_trend_backtest_runs(config):
@@ -155,5 +190,5 @@ def test_trend_backtest_runs(config):
     m = config.instruments["SPY"].to_market_info("SPY")
     res = BacktestEngine(cfg(initial_cash=150, maker_fee=0, taker_fee=0, qty_step=m.qty_step, min_notional=1,
                              participation_rate=0.01)).run(
-        df, TrendBacktest(config.strategies.stock_trend, m, 150, 0.01, 75), start_index=60)
+        df, TrendBacktest(config.strategies.stock_trend, m, 3.75, 1.0, 120), start_index=60)
     assert res.metrics.benchmark_return is not None and res.metrics.max_drawdown < 0.5

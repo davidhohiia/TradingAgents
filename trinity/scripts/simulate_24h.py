@@ -42,9 +42,10 @@ def build_markets(clock: SimClock, seed: int, hours: float, cal: UsEquityCalenda
     outage = (START + timedelta(hours=hours * 0.3), START + timedelta(hours=hours * 0.3, minutes=30))
     crypto = SimulatedMarket(
         "sim-crypto", AssetClass.CRYPTO,
-        [SymbolSpec("BTC/USDT", 60000, "15m", annual_vol=0.55, level_qty_usd=60_000,
-                    regimes=[(hours * 0.55, -25.0), (hours * 0.7, 0.0)]),
-         SymbolSpec("ETH/USDT", 3000, "15m", annual_vol=0.7, level_qty_usd=60_000)],
+        [SymbolSpec("BTC/USDT", 60000, "1h", annual_vol=0.55, annual_drift=4.0, level_qty_usd=60_000,
+                    regimes=[(hours * 0.55, -25.0), (hours * 0.7, 2.0)]),
+         SymbolSpec("ETH/USDT", 3000, "1h", annual_vol=0.7, annual_drift=4.0, level_qty_usd=60_000),
+         SymbolSpec("SOL/USDT", 150, "1h", annual_vol=0.9, annual_drift=4.0, level_qty_usd=60_000)],
         clock, seed=seed, error_rate=0.02, stale_rate=0.01, outages=[outage])
     stocks = SimulatedMarket(
         "sim-stocks", AssetClass.STOCK,
@@ -53,8 +54,8 @@ def build_markets(clock: SimClock, seed: int, hours: float, cal: UsEquityCalenda
          SymbolSpec("VTI", 250, "1Day", annual_vol=0.17, annual_drift=0.3, bar_volume=4e6, history_bars=260)],
         clock, seed=seed + 1, error_rate=0.01, session_check=cal.is_open)
     arb = {name: SimulatedMarket(name, AssetClass.CRYPTO,
-                                 [SymbolSpec("BTC/USDT", 60000 * (1 + 0.0004 * i), "15m", spread_bps=3),
-                                  SymbolSpec("ETH/USDT", 3000 * (1 - 0.0003 * i), "15m", spread_bps=3)],
+                                 [SymbolSpec("BTC/USDT", 60000 * (1 + 0.0004 * i), "1h", spread_bps=3),
+                                  SymbolSpec("ETH/USDT", 3000 * (1 - 0.0003 * i), "1h", spread_bps=3)],
                                  clock, seed=seed + 10, error_rate=0.03)  # same price path, small offsets
            for i, name in enumerate(["sim-ex-a", "sim-ex-b", "sim-ex-c"])}
     return crypto, stocks, arb
@@ -88,8 +89,17 @@ def check_invariants(repo: Repository, app, config) -> list[str]:  # noqa: ANN00
             problems.append(f"negative available capital {sid}")
         if sid == "arbitrage" and (c["deployed"] or c["reserved"]):
             problems.append("arbitrage used real (paper) capital")
+    eq = app.engine.account_equity()
+    if app.engine.open_risk() > config.risk.max_total_open_risk_pct * eq * 1.25:
+        problems.append(f"open risk {app.engine.open_risk():.2f} far above limit")
+    if repo.query("SELECT COUNT(*) FROM orders WHERE leverage > 1")[0][0]:
+        problems.append("leveraged order placed while leverage is disabled")
+    for o in orders:
+        if o.side == Side.BUY and o.stop_price and o.price and \
+                o.quantity * (o.price - o.stop_price) > config.risk.max_risk_per_trade_pct * eq * 1.05 + 0.01:
+            problems.append(f"order risk above 0.75% of equity {o.client_order_id}")
     exp = app.pm.risk_data()["exposure"]
-    if exp > config.risk.max_total_exposure_pct * config.capital.total_capital_usd + 1:
+    if exp > config.risk.max_total_exposure_pct * app.engine.account_equity() + 1:
         problems.append(f"exposure {exp:.2f} above limit")
     return problems
 
@@ -109,6 +119,8 @@ async def simulate(hours: float, seed: int, tick: float, out_dir: Path) -> dict:
     ticks = 0
     restart_at = START + timedelta(hours=hours / 2)
     restarted = False
+    deposit_at = START + timedelta(hours=hours * 0.75)
+    deposited = False
     app = None
 
     async def boot():
@@ -126,6 +138,13 @@ async def simulate(hours: float, seed: int, tick: float, out_dir: Path) -> dict:
         ticks += 1
         if ticks % 360 == 0:
             invariant_violations += check_invariants(repo, app, config)
+        if not deposited and clock.now() >= deposit_at:
+            deposited = True
+            before = app.pm.equity_breakdown()
+            app.pm.register_deposit(200, "simulated monthly deposit")
+            after = app.pm.equity_breakdown()
+            if abs(after["trading_profit"] - before["trading_profit"]) > 1e-6:
+                invariant_violations.append("deposit changed trading profit")
         if not restarted and clock.now() >= restart_at:
             # simulated crash/restart: drop the whole object graph, keep DB + exchange state
             restarted = True
@@ -139,7 +158,7 @@ async def simulate(hours: float, seed: int, tick: float, out_dir: Path) -> dict:
     status_counts = Counter(o.status.value for o in orders)
     risk_events = Counter(r["event_type"] for r in repo.query("SELECT event_type FROM risk_events"))
     stats = repo.trade_stats(Mode.PAPER)
-    per_strategy = {sid: dict(repo.trade_stats(Mode.PAPER, sid)) for sid in ("crypto_grid", "stock_trend")}
+    per_strategy = {sid: dict(repo.trade_stats(Mode.PAPER, sid)) for sid in ("crypto_momentum", "stock_trend")}
     arb_rows = repo.query("SELECT COUNT(*), SUM(accepted), SUM(virtual_executed) FROM arbitrage_opportunities")[0]
     report = {
         "NOTE": "SYNTHETIC market data with injected faults. PnL is NOT evidence of real performance.",
@@ -158,6 +177,10 @@ async def simulate(hours: float, seed: int, tick: float, out_dir: Path) -> dict:
         "arbitrage": {"recorded": arb_rows[0], "accepted": arb_rows[1] or 0, "virtual_executed": arb_rows[2] or 0},
         "scheduler": {n: {"runs": t.runs, "failures": t.failures} for n, t in app.pm.scheduler.tasks.items()},
         "invariant_violations": sorted(set(invariant_violations)),
+        "deposit_registered": deposited, "capital": {k: v for k, v in app.pm.capital_data().items()
+                                                     if k in ("contributed", "equity", "trading_profit", "reserve",
+                                                              "allocations")},
+        "per_sub_strategy": app.pm.performance.per_sub_strategy(Mode.PAPER),
         "database": str(settings.database_path),
     }
     await app.pm.stop()

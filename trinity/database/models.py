@@ -29,6 +29,11 @@ REQUIRED_TABLES = (
     "market_data",
     "bot_health",
     "system_events",
+    "deposits",
+    "capital_allocations",
+    "reallocation_proposals",
+    "api_health",
+    "funding_payments",
 )
 
 
@@ -69,6 +74,8 @@ def row_to_order(row: sqlite3.Row) -> OrderRecord:
         error=row["error"],
         created_at=str_to_ts(row["created_at"]),  # type: ignore[arg-type]
         updated_at=str_to_ts(row["updated_at"]),  # type: ignore[arg-type]
+        sub_strategy=row["sub_strategy"] or "",
+        leverage=float(row["leverage"] or 1.0),
     )
 
 
@@ -89,4 +96,8 @@ def row_to_position(row: sqlite3.Row) -> Position:
         updated_at=str_to_ts(row["updated_at"]),  # type: ignore[arg-type]
         correlation_group=row["correlation_group"] or "",
         asset_class=AssetClass(row["asset_class"]),
+        sub_strategy=row["sub_strategy"] or "",
+        leverage=float(row["leverage"] or 1.0),
+        liquidation_price=row["liquidation_price"],
+        funding_paid=float(row["funding_paid"] or 0.0),
     )

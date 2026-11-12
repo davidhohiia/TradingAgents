@@ -7,6 +7,7 @@ between exchanges. Enabling real execution requires a separate review and new co
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 from trinity.ai.anomaly_detector import AnomalyDetector
@@ -38,6 +39,7 @@ class ArbitrageBot(BaseBot):
         if self.sim.per_asset_usd < cfg.trade_size_usd:
             self.log.warning("virtual inventory per asset %.0f < trade size %.0f: virtual trades will be skipped",
                              self.sim.per_asset_usd, cfg.trade_size_usd)
+        self.latency_ms: dict[str, float] = {}
         self.stats: dict[str, Any] = state.get("stats", {"scans": 0, "accepted": 0, "rejected": 0})
 
     def status(self) -> BotStatus:
@@ -46,15 +48,16 @@ class ArbitrageBot(BaseBot):
             return base
         return BotStatus.SCAN_ONLY
 
-    async def _fetch(self, venue: str, symbol: str) -> OrderBook | BaseException:
+    async def _fetch(self, venue: str, symbol: str) -> tuple[OrderBook | BaseException, float]:
+        """Fetch a snapshot and measure the request latency (data-delay control)."""
+        start = time.perf_counter()
         try:
-            return await asyncio.wait_for(
+            book = await asyncio.wait_for(
                 self.sources[venue].fetch_order_book(symbol, self.cfg.orderbook_depth), self.fetch_timeout)
+            return book, (time.perf_counter() - start) * 1000
         except (TimeoutError, Exception) as exc:  # noqa: BLE001
             self.anomaly.record_api_call(venue, False, self.clock.now())
-            return exc
-        finally:
-            pass
+            return exc, (time.perf_counter() - start) * 1000
 
     async def step(self) -> None:
         if len(self.sources) < 2:
@@ -66,14 +69,16 @@ class ArbitrageBot(BaseBot):
         for symbol in self.cfg.symbols:
             venues = list(self.sources)
             results = await asyncio.gather(*(self._fetch(v, symbol) for v in venues))
-            books = dict(zip(venues, results, strict=True))
+            books = {v: r[0] for v, r in zip(venues, results, strict=True)}
+            latencies = {v: r[1] for v, r in zip(venues, results, strict=True)}
+            self.latency_ms.update(latencies)
             for v, b in books.items():
                 if isinstance(b, OrderBook):
                     all_failed = False
                     self.anomaly.record_api_call(v, True, now)
                     if b.mid:
                         self.sim.seed_inventory(symbol.split("/")[0], b.mid, len(self.cfg.symbols))
-            opps = self.scanner.evaluate(symbol, books, now)
+            opps = self.scanner.evaluate(symbol, books, now, latencies)
             self.stats["scans"] += 1
             accepted = [o for o in opps if o.accepted]
             self.stats["accepted"] += len(accepted)
@@ -94,6 +99,7 @@ class ArbitrageBot(BaseBot):
             }
         self.save_state({"virtual": self.sim.book.to_dict(), "stats": self.stats})
         self.info = {"mode": "SCAN ONLY / VIRTUAL", "symbols": summary, "stats": self.stats,
-                     "virtual_pnl": round(self.sim.book.net_pnl, 4), "virtual_trades": self.sim.book.trades}
+                     "virtual_pnl": round(self.sim.book.net_pnl, 4), "virtual_trades": self.sim.book.trades,
+                     "fetch_latency_ms": {k: round(v, 1) for k, v in self.latency_ms.items()}}
         if all_failed:
             raise ExchangeUnavailable("all arbitrage exchanges unavailable")

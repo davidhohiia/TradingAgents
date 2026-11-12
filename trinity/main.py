@@ -50,8 +50,12 @@ def environment_report(settings: Settings, config: AppConfig) -> list[str]:
         f"allowed ids: {len(settings.allowed_telegram_ids)}",
         f"capital: total ${config.capital.total_capital_usd}, allocations {config.capital.allocations}, "
         f"reserve ${config.capital.reserve_usd}",
-        f"risk: daily loss {config.risk.max_daily_loss_pct:.1%}, max DD {config.risk.max_drawdown_pct:.1%}, "
-        f"exposure {config.risk.max_total_exposure_pct:.0%}, leverage {config.risk.leverage}",
+        f"risk: per trade {config.risk.max_risk_per_trade_pct:.2%}, open risk {config.risk.max_total_open_risk_pct:.0%}, "
+        f"daily {config.risk.max_daily_loss_pct:.0%}, weekly {config.risk.max_weekly_loss_pct:.0%}, DD tiers "
+        f"{config.risk.drawdown_warning_pct:.0%}/{config.risk.drawdown_reduce_pct:.0%}/"
+        f"{config.risk.drawdown_live_lock_pct:.0%}/{config.risk.drawdown_emergency_pct:.0%}",
+        f"leverage: {'enabled in config (still gated)' if config.leverage.enabled else 'OFF'}; "
+        f"LIVE_LEVERAGE_ENABLED={settings.live_leverage_enabled}; reinvest profits {config.capital.reinvest_profits}",
     ]
     if settings.account_currency == "EUR" and not settings.eur_usd_rate:
         lines.append("WARNING: ACCOUNT_CURRENCY=EUR but EUR_USD_RATE not set")

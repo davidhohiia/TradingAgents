@@ -25,7 +25,8 @@ if __package__ in (None, ""):
 import pandas as pd  # noqa: E402
 
 from trinity.backtesting.engine import BacktestConfig, BacktestEngine  # noqa: E402
-from trinity.backtesting.strategies import GridBacktest, TrendBacktest  # noqa: E402
+from trinity.backtesting.lookahead_check import check_backtest_causality
+from trinity.backtesting.strategies import MomentumBacktest, TrendBacktest  # noqa: E402
 from trinity.backtesting.walk_forward import (  # noqa: E402
     chronological_split,
     optimize_holdout,
@@ -78,13 +79,14 @@ async def download(exchange: str, symbol: str, timeframe: str, bars: int, out: P
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--strategy", choices=["grid", "trend"], default="grid")
+    ap.add_argument("--strategy", choices=["momentum", "trend"], default="momentum")
     ap.add_argument("--csv", type=Path)
     ap.add_argument("--symbol", default="BTC/USDT")
     ap.add_argument("--synthetic", action="store_true")
     ap.add_argument("--walk-forward", action="store_true")
     ap.add_argument("--download")
-    ap.add_argument("--timeframe", default="15m")
+    ap.add_argument("--timeframe", default="1h")
+    ap.add_argument("--check-lookahead", action="store_true", help="verify no future-data leakage")
     ap.add_argument("--bars", type=int, default=3000)
     args = ap.parse_args()
     cfg = load_app_config()
@@ -93,7 +95,7 @@ def main() -> int:
         print("saved", asyncio.run(download(args.download, args.symbol, args.timeframe, args.bars, out)))
         return 0
     if args.synthetic:
-        df = (synthetic(args.bars, "15m") if args.strategy == "grid"
+        df = (synthetic(args.bars, "1h", volume=5000) if args.strategy == "momentum"
               else synthetic(args.bars, "1d", price=400.0, volume=5e6, drift=0.08))
         print("!!! SYNTHETIC DATA: pipeline self-test only, NOT evidence of real performance !!!")
     elif args.csv:
@@ -102,30 +104,34 @@ def main() -> int:
         ap.error("--csv or --synthetic required")
     inst = cfg.instruments[args.symbol]
     market = inst.to_market_info(args.symbol)
-    alloc = cfg.allocation("crypto_grid" if args.strategy == "grid" else "stock_trend")
+    alloc = cfg.allocation("crypto_momentum" if args.strategy == "momentum" else "stock_trend")
+    max_risk = cfg.risk.max_risk_per_trade_pct * cfg.capital.total_capital_usd
     bt = BacktestConfig(initial_cash=alloc, maker_fee=inst.maker_fee, taker_fee=inst.taker_fee,
                         qty_step=market.qty_step, min_notional=market.min_notional,
-                        periods_per_year=365 * 96 if args.strategy == "grid" else 252)
-    if args.strategy == "grid":
-        base = cfg.strategies.crypto_grid
+                        periods_per_year=365 * 24 if args.strategy == "momentum" else 252)
+    if args.strategy == "momentum":
+        base = cfg.strategies.crypto_momentum
 
         def factory(params: dict):  # noqa: ANN202
             c = base.model_copy(deep=True)
-            for k, v in params.items():
-                setattr(c.grid, k, v)
-            return GridBacktest(c, market, alloc, cfg.risk.max_risk_per_trade_pct)
+            c.momentum.stop_atr_multiplier = params["stop"]
+            c.breakout.lookback_bars = params["lookback"]
+            return MomentumBacktest(c, market, max_risk, cfg.risk.max_order_notional_usd)
 
-        space = {"atr_spacing_multiplier": [0.4, 0.6, 0.9], "levels": [2, 3, 4]}
-        warmup = base.regime.trend_period + base.regime.slope_lookback + 5
+        space = {"stop": [1.5, 2.0, 2.5], "lookback": [20, 40]}
+        warmup = base.indicators.ema_slow + 10
     else:
         base_t = cfg.strategies.stock_trend
 
         def factory(params: dict):  # noqa: ANN202
             c = base_t.model_copy(update=params)
-            return TrendBacktest(c, market, alloc, cfg.risk.max_risk_per_trade_pct, cfg.risk.max_order_notional_usd)
+            return TrendBacktest(c, market, max_risk, 1.0, cfg.risk.max_order_notional_usd)
 
         space = {"stop_atr_multiplier": [1.5, 2.0, 2.5], "take_profit_r": [2.0, 3.0]}
         warmup = base_t.ema_slow + 15
+    if args.check_lookahead:
+        rep = check_backtest_causality(df, lambda: factory({k: v[0] for k, v in space.items()}), bt, warmup)
+        print("look-ahead check:", "PASSED" if rep.ok else f"FAILED {rep.violations}")
     if args.walk_forward:
         n = len(df) - warmup
         folds = walk_forward(df, factory, space, bt, warmup=warmup, train_bars=int(n * 0.4), test_bars=int(n * 0.15))

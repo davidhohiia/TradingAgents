@@ -14,7 +14,11 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any
 
-from trinity.ai.performance_analyzer import PerformanceAnalyzer
+from trinity.ai.performance_analyzer import StrategyAnalytics
+from trinity.core.capital_growth import CapitalGrowthManager
+from trinity.monitoring.api_monitor import ApiMonitor
+from trinity.risk.leverage import funding_cost
+from trinity.risk.risk_manager import RiskAction
 from trinity.bots.base import BaseBot
 from trinity.config.settings import AppConfig
 from trinity.core.capital_allocator import CapitalAllocator
@@ -45,6 +49,8 @@ class PortfolioManager:
         bots: list[BaseBot],
         clock: Clock | None = None,
         notifier: Notifier | None = None,
+        growth: CapitalGrowthManager | None = None,
+        api_monitor: ApiMonitor | None = None,
     ) -> None:
         self.config = config
         self.repo = repo
@@ -58,7 +64,13 @@ class PortfolioManager:
         self.notifier = notifier or LogNotifier()
         self.scheduler = Scheduler(self.clock)
         self.scheduler.on_failure = self._on_task_failure
-        self.performance = PerformanceAnalyzer(repo)
+        self.performance = StrategyAnalytics(repo)
+        self.growth = growth or CapitalGrowthManager(repo, config, clock)
+        # single source of truth for contributed capital and allocations
+        engine.contributed_fn = self.growth.contributed
+        engine.allocator._allocation_fn = self.growth.allocation  # noqa: SLF001
+        engine.allocator._all_fn = self.growth.allocations  # noqa: SLF001
+        self.api_monitor = api_monitor
         self.restarts: dict[str, int] = dict.fromkeys(self.bots, 0)
         self._last_equity_snapshot: datetime | None = None
         self._last_report_day: str | None = repo.get_kv(f"pm:{mode.value}:last_report_day")
@@ -80,6 +92,9 @@ class PortfolioManager:
         self.scheduler.add("sync_orders", 15, self.engine.sync_orders, timeout=120)
         self.scheduler.add("risk_monitor", 30, self.monitor, timeout=60)
         self.scheduler.add("daily_report", 300, self.maybe_daily_report, timeout=60)
+        self.scheduler.add("analytics", 3600, self.analytics, timeout=120, run_immediately=False)
+        self.scheduler.add("api_health", 300, self.api_health, timeout=30, run_immediately=False)
+        self.scheduler.add("funding", 3600, self.accrue_funding, timeout=60, run_immediately=False)
         self.repo.add_system_event("INFO", "portfolio", "start", f"started in {self.mode.value} mode",
                                    {"bots": list(self.bots)}, ts=self.clock.now())
         await self.notifier.notify("system", f"TRINITY started. {tpl.MODE_BANNER[self.mode.value]}")
@@ -146,10 +161,14 @@ class PortfolioManager:
                 self.positions.mark_to_market(symbol, price, self.clock.now())
 
     def equity_breakdown(self) -> dict[str, float]:
+        """Equity = contributed capital (all deposits) + net realized + unrealized PnL.
+        Deposits are never counted as profit."""
         t = self.positions.totals()
-        equity = self.config.capital.total_capital_usd + t["realized"] + t["unrealized"]
+        contributed = self.growth.contributed()
+        equity = contributed + t["realized"] + t["unrealized"]
         return {
-            "equity": equity, "realized": t["realized"], "unrealized": t["unrealized"],
+            "equity": equity, "contributed": contributed, "trading_profit": equity - contributed,
+            "realized": t["realized"], "unrealized": t["unrealized"],
             "invested": t["invested"], "market_value": t["market_value"],
             "cash": equity - t["market_value"],
         }
@@ -160,17 +179,7 @@ class PortfolioManager:
         self.last_equity = eq["equity"]
         actions = self.risk.on_equity(eq["equity"])
         for a in actions:
-            if a.kind == "DAILY_LOCK":
-                n = await self.engine.cancel_where(side=Side.BUY, reason="daily loss limit")
-                await self.notifier.notify("risk_limit", f"⛔ {a.message}. Canceled {n} buy orders. "
-                                           "Positions kept; new entries blocked until next UTC day.", "CRITICAL")
-            elif a.kind == "DRAWDOWN_LOCK":
-                n = await self.engine.cancel_where(reason="max drawdown lock")
-                await self.notifier.notify("risk_limit", f"🛑 {a.message} Canceled {n} open orders. Positions were NOT "
-                                           "liquidated. Run scripts/emergency_stop.py --confirm-drawdown after review.",
-                                           "CRITICAL")
-            elif a.kind == "DRAWDOWN_WARNING":
-                await self.notifier.notify("drawdown_warning", f"⚠️ {a.message}", "WARNING")
+            await self._handle_risk_action(a)
         now = self.clock.now()
         st = self.risk.last_status
         if self._last_equity_snapshot is None or now - self._last_equity_snapshot >= EQUITY_SNAPSHOT_EVERY:
@@ -181,6 +190,124 @@ class PortfolioManager:
                 self.repo.upsert_daily_metrics(st.day, self.mode, "ALL", start_equity=st.day_start_equity,
                                                end_equity=eq["equity"], realized_pnl=eq["realized"],
                                                unrealized_pnl=eq["unrealized"], max_drawdown=st.max_drawdown_pct)
+
+    async def _handle_risk_action(self, a: RiskAction) -> None:
+        if a.kind in ("DAILY_LOCK", "WEEKLY_LOCK"):
+            n = await self.engine.cancel_where(side=Side.BUY, reason=a.kind.lower())
+            period = "UTC day" if a.kind == "DAILY_LOCK" else "ISO week"
+            await self.notifier.notify("risk_limit", f"⛔ {a.message}. Canceled {n} entry orders. Positions kept; "
+                                       f"new entries blocked until the next {period}.", "CRITICAL")
+        elif a.kind in ("DRAWDOWN_LOCK", "HARD_STOP"):
+            n = await self.engine.cancel_where(reason=a.kind.lower())  # unfilled orders only: always safe
+            pos = self.positions_data()
+            lines = [f"• {p['strategy_id']} {p['symbol']} {p['quantity']:g} @ {p['avg']:.2f} uPnL ${p['upnl']:+.2f} "
+                     f"stop {p['stop'] if p['stop'] else 'n/a'}" for p in pos] or ["• no open positions"]
+            how = ("scripts/emergency_stop.py --clear-hard-stop" if a.kind == "HARD_STOP"
+                   else "scripts/emergency_stop.py --confirm-drawdown")
+            self.repo.set_kv(f"pm:{self.mode.value}:positions_at_lock", pos)
+            await self.notifier.notify(
+                "risk_limit", f"🛑 {a.message}\nCanceled {n} unfilled orders. Positions were NOT liquidated "
+                f"(protective stops stay active):\n" + "\n".join(lines)
+                + f"\nEquity ${self.last_equity:.2f}. Resume only after review: {how}", "CRITICAL")
+        elif a.kind == "REDUCED_ACTIVITY":
+            await self.notifier.notify("drawdown_warning", f"⚠️ {a.message}", "WARNING")
+        elif a.kind == "DRAWDOWN_WARNING":
+            await self.notifier.notify("drawdown_warning", f"⚠️ {a.message}", "WARNING")
+
+    # ------------------------------------------------------------------ analytics / monitoring tasks
+    async def analytics(self) -> None:
+        """Strategy degradation, real-vs-virtual divergence, correlation (alerts only, never parameter changes)."""
+        deg = self.performance.degradation_report(self.mode)
+        previous = self.repo.get_kv(f"analytics:{self.mode.value}:degraded") or {}
+        self.repo.set_kv(f"analytics:{self.mode.value}:degraded", deg)
+        for key, notes in deg.items():
+            if key not in previous:
+                self.repo.add_risk_event(self.mode, "WARNING", "STRATEGY_DEGRADATION", "; ".join(notes),
+                                         strategy_id=key, ts=self.clock.now())
+                await self.notifier.notify("degradation", f"📉 Strategy degradation detected: {key}: "
+                                           + "; ".join(notes) + " (no parameters changed automatically)", "WARNING")
+        self.repo.set_kv(f"analytics:{self.mode.value}:strategy_correlation",
+                         self.performance.strategy_correlations(self.mode))
+
+    async def api_health(self) -> None:
+        if self.api_monitor is None:
+            return
+        self.api_monitor.flush(self.repo, self.clock.now())
+        for problem in self.api_monitor.problems():
+            await self.notifier.notify("api_error", problem, "WARNING")
+
+    async def accrue_funding(self) -> None:
+        """Funding on leveraged (isolated margin) positions. No-op while leverage is disabled."""
+        now = self.clock.now()
+        last = self.repo.get_kv(f"funding:{self.mode.value}:last")
+        hours = 1.0 if last is None else (now - datetime.fromisoformat(last)).total_seconds() / 3600
+        self.repo.set_kv(f"funding:{self.mode.value}:last", now.isoformat())
+        for p in self.positions.all(open_only=True):
+            if p.leverage <= 1.0:
+                continue
+            venue = self.engine.venues.get(p.venue)
+            fetch = getattr(venue, "fetch_funding_rate", None)
+            if fetch is None:
+                continue
+            try:
+                rate = await fetch(p.symbol)
+            except ExchangeError as exc:
+                log.warning("funding rate unavailable: %s", exc)
+                continue
+            amount = funding_cost(p.market_value, rate, hours)
+            self.positions.apply_funding(p.strategy_id, p.venue, p.symbol, amount, now)
+            self.repo.add_funding_payment(now, self.mode, p.strategy_id, p.symbol, rate, p.market_value, amount)
+            if rate > self.config.leverage.max_funding_rate_8h:
+                await self.notifier.notify("funding", f"Funding {rate:.4%}/8h on {p.symbol} above limit", "WARNING")
+            if p.liquidation_price and p.last_price and p.last_price <= p.liquidation_price * 1.05:
+                self.repo.add_risk_event(self.mode, "CRITICAL", "LIQUIDATION_RISK",
+                                         f"{p.symbol} price {p.last_price} within 5% of liquidation {p.liquidation_price}",
+                                         strategy_id=p.strategy_id, symbol=p.symbol, ts=now)
+                await self.notifier.notify("risk_limit", f"Liquidation risk on {p.symbol}", "CRITICAL")
+
+    # ------------------------------------------------------------------ capital growth
+    def register_deposit(self, amount: float, note: str = "", currency: str = "USD", fx_rate: float = 1.0) -> int:
+        return self.growth.register_deposit(amount, note=note, currency=currency, fx_rate=fx_rate)
+
+    def propose_reallocation(self) -> tuple[list[int], list[str]]:
+        perf = {sid: self.performance.strategy_performance(sid, self.mode).__dict__ for sid in self.bots}
+        perf = {sid: {"trades": p["trades"], "net_pnl": p["net_pnl"], "profit_factor": p["profit_factor"],
+                      "win_rate": p["win_rate"]} for sid, p in perf.items()}
+        st = self.risk.last_status
+        degraded = {k.split(".")[0] for k in (self.repo.get_kv(f"analytics:{self.mode.value}:degraded") or {})}
+        return self.growth.propose(perf, self.risk.blocking_locks(), st.drawdown_pct if st else 0.0, degraded)
+
+    def approve_reallocation(self, proposal_id: int, confirmation: str) -> tuple[bool, list[str]]:
+        rows = self.repo.query("SELECT * FROM reallocation_proposals WHERE id=?", (proposal_id,))
+        st = self.risk.last_status
+        res = self.growth.approve(proposal_id, confirmation, self.risk.blocking_locks(), st.drawdown_pct if st else 0.0)
+        if res.ok and rows and self.mode == Mode.PAPER:
+            # paper: simulate the transfer from the (off-venue) reserve to the strategy's venue account
+            sid, amount = rows[0]["strategy_id"], float(rows[0]["amount_usd"])
+            bot = self.bots.get(sid)
+            venue = self.engine.venues.get(getattr(getattr(bot, "gateway", None), "venue", ""), None)
+            if venue is not None and hasattr(venue, "balances"):
+                quote = "USDT" if sid == "crypto_momentum" else "USD"
+                venue._bal(quote).free += amount  # noqa: SLF001
+                venue._changed()  # noqa: SLF001
+        return res.ok, res.reasons
+
+    def capital_data(self) -> dict[str, Any]:
+        eq = self.equity_breakdown()
+        fees = sum(p.fees_paid for p in self.positions.all())
+        summary = self.growth.summary(eq["equity"], fees)
+        points = [(datetime.fromisoformat(r["ts"]), float(r["equity"])) for r in self.repo.equity_history(self.mode)]
+        summary["monthly"] = self.growth.monthly_returns(points)
+        summary["pending_proposals"] = self.growth.pending()
+        summary["mode"] = self.mode.value
+        return summary
+
+    def strategies_data(self) -> dict[str, Any]:
+        return {"mode": self.mode.value, "stats": self.performance.per_sub_strategy(self.mode),
+                "real_vs_virtual": {sid: self.performance.real_vs_virtual(sid) for sid in self.bots
+                                    if sid != "arbitrage"},
+                "degraded": self.repo.get_kv(f"analytics:{self.mode.value}:degraded") or {},
+                "strategy_correlation": self.repo.get_kv(f"analytics:{self.mode.value}:strategy_correlation") or {}}
 
     # ------------------------------------------------------------------ reports
     def daily_report_data(self, day: str | None = None) -> dict[str, Any]:
@@ -204,6 +331,8 @@ class PortfolioManager:
             "max_drawdown": float(dd.get("max_dd", 0.0)), "trades_today": int(stats["n"]),
             "wins": int(stats["wins"]), "losses": int(stats["losses"]), "fees": float(stats["fees"]),
             "by_strategy": by_strategy, "recommendations": recs,
+            "contributed": eq["contributed"], "trading_profit": eq["trading_profit"],
+            "weekly_pnl": eq["equity"] - float(dd.get("week_start", eq["equity"])),
         }
 
     async def maybe_daily_report(self) -> None:
@@ -238,7 +367,7 @@ class PortfolioManager:
         caps = self.allocator.summary(self.positions.all(), active, self.positions.realized_by_strategy())
         return {
             "mode": self.mode.value, "equity": eq["equity"], "cash": eq["cash"], "invested": eq["invested"],
-            "reserve": self.config.capital.reserve_usd,
+            "reserve": self.growth.reserve(), "contributed": eq["contributed"],
             "strategies": {sid: {"allocation": c.allocation, "deployed": c.deployed, "reserved": c.reserved,
                                  "available": c.available} for sid, c in caps.items()},
         }
@@ -249,7 +378,7 @@ class PortfolioManager:
         st = self.risk.last_status
         return {"mode": self.mode.value, "realized": eq["realized"], "unrealized": eq["unrealized"],
                 "daily_pnl": st.daily_pnl if st else None,
-                "total_pnl": eq["equity"] - self.config.capital.total_capital_usd,
+                "total_pnl": eq["trading_profit"], "contributed": eq["contributed"],
                 "fees": sum(p.fees_paid for p in self.positions.all()), "trades": int(s["n"])}
 
     def positions_data(self) -> list[dict[str, Any]]:
@@ -261,6 +390,7 @@ class PortfolioManager:
         d = self.risk.status_summary()
         exp = self.engine.exposure.snapshot(self.positions.all(open_only=True), self.repo.list_active_orders(self.mode))
         d["exposure"] = exp.total
+        d["open_risk"] = self.engine.open_risk()
         return d
 
     def pause(self, reason: str = "operator") -> None:

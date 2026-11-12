@@ -5,18 +5,14 @@ from __future__ import annotations
 from datetime import UTC
 
 from trinity.backtesting.engine import BarContext, BtOrder
-from trinity.bots.crypto_grid.strategy import GridStrategy, GridSymbolState, Lot
+from trinity.bots.crypto_momentum.planner import MomentumPlanner
+from trinity.bots.crypto_momentum.strategies.base import TradeState
 from trinity.bots.stock_trend.signals import compute_signals
 from trinity.bots.stock_trend.strategy import PositionState, StockTrendStrategy
-from trinity.config.settings import GridStrategyConfig, StockTrendConfig
+from trinity.config.settings import CryptoMomentumConfig, StockTrendConfig
 from trinity.core.models import (
     MarketInfo,
-    Mode,
     OrderBook,
-    OrderRecord,
-    OrderStatus,
-    OrderType,
-    Side,
 )
 
 
@@ -28,79 +24,62 @@ def _book_from_close(close: float, ts, spread_bps: float) -> OrderBook:  # noqa:
     return OrderBook("BT", [(close - hs, 1e12)], [(close + hs, 1e12)], ts, "backtest", synthetic=True)
 
 
-class GridBacktest:
-    """Runs GridStrategy.plan() bar by bar. Order ids are assigned by the engine after on_bar
-    returns, so sells are bound to their lots at the start of the next bar."""
+class MomentumBacktest:
+    """Crypto Momentum (momentum + confirmed breakout) on one symbol, using the bot's MomentumPlanner."""
 
-    def __init__(self, cfg: GridStrategyConfig, market: MarketInfo, capital: float, risk_pct: float,
-                 spread_bps: float = 2.0) -> None:
-        self.strategy = GridStrategy(cfg)
+    def __init__(self, cfg: CryptoMomentumConfig, market: MarketInfo, max_risk_usd: float,
+                 max_order_notional: float, spread_bps: float = 2.0) -> None:
+        self.planner = MomentumPlanner(cfg)
         self.market = market
-        self.max_risk = capital * risk_pct
+        self.max_risk = max_risk_usd
+        self.max_order = max_order_notional
         self.spread_bps = spread_bps
-        self.st = GridSymbolState()
-        self._pending_bind: list[tuple[BtOrder, list[str]]] = []
-        self._new_buys: list[tuple[BtOrder, float]] = []
-        self._last_ts = None
-
-    def _apply_fills(self, ctx: BarContext) -> None:
-        for o, cids in self._pending_bind:
-            for lot in self.st.lots:
-                if lot.buy_cid in cids:
-                    lot.sell_cid = str(o.id)
-        self._pending_bind = []
-        for o, level in self._new_buys:
-            if o.id:
-                self.st.buy_orders[str(o.id)] = level
-                self.st.buy_created[str(o.id)] = _iso(self._last_ts)
-        self._new_buys = []
-        for f in ctx.fills_last_bar:
-            if f.side == "buy":
-                lot = next((lot_ for lot_ in self.st.lots if lot_.buy_cid == str(f.order_id)), None)
-                if lot is None:
-                    lot = Lot(str(f.order_id), 0.0, f.price)
-                    self.st.lots.append(lot)
-                lot.qty += f.qty
-            elif f.tag == "stop":
-                self.st.lots.clear()
-            else:
-                remaining = f.qty
-                for lot in [lot_ for lot_ in self.st.lots if lot_.sell_cid == str(f.order_id)]:
-                    take = min(lot.qty, remaining)
-                    lot.qty -= take
-                    remaining -= take
-        excess = sum(lot_.qty for lot_ in self.st.lots) - ctx.position
-        if excess > 1e-12:
-            for lot in reversed(self.st.lots):
-                take = min(lot.qty, excess)
-                lot.qty -= take
-                excess -= take
-        self.st.lots = [lot_ for lot_ in self.st.lots if lot_.qty > 1e-12]
+        self.state: TradeState | None = None
+        self.pending: tuple[str, float, float, float, float, float | None] | None = None
+        self.cooldown_until = -1
+        self.cooldown_bars = cfg.cooldown_bars_after_exit
+        self.trades_by_strategy: dict[str, int] = {"momentum": 0, "breakout": 0}
 
     def on_bar(self, ctx: BarContext) -> tuple[list[BtOrder], list[int]]:
-        self._apply_fills(ctx)
-        close = float(ctx.history["close"].iloc[-1])
-        book = _book_from_close(close, ctx.ts, self.spread_bps)
-        self._last_ts = book.ts
-        active = [
-            OrderRecord(str(o.id), "bt", "bt", "BT", Mode.PAPER, Side(o.side),
-                        OrderType.LIMIT if o.kind == "limit" else OrderType.MARKET, o.qty, OrderStatus.OPEN,
-                        price=o.price, filled_quantity=o.filled)
-            for o in ctx.open_orders
-        ]
-        plan = self.strategy.plan(df=ctx.history, book=book, now=book.ts, st=self.st, position_qty=ctx.position,
-                                  active=active, market=self.market, max_risk_usd=self.max_risk)
-        new: list[BtOrder] = []
-        for spec in plan.orders:
-            kind = "market" if spec.order_type == OrderType.MARKET else "limit"
-            o = BtOrder(spec.side.value, kind, spec.qty, spec.price, tag="stop" if spec.protective else "")
-            new.append(o)
-            if spec.side == Side.SELL:
-                self._pending_bind.append((o, list(spec.lot_buy_cids)))
-        # buy orders are tracked by the strategy state via their (engine-assigned) ids next bar
-        self._new_buys = [(o, spec.level) for o, spec in zip(new, plan.orders, strict=True)
-                          if spec.side == Side.BUY and spec.level is not None]
-        return new, [int(c) for c in dict.fromkeys(plan.cancel)]
+        for f in ctx.fills_last_bar:
+            if f.side == "buy" and self.pending is not None:
+                name, stop, tp, trail, act, level = self.pending
+                self.state = TradeState(name, ctx.avg_cost, stop, tp, f.price, trail, act, level)
+                self.trades_by_strategy[name] += 1
+                self.pending = None
+        if ctx.position <= 0 and self.state is not None:
+            self.state = None
+            self.cooldown_until = ctx.index + self.cooldown_bars
+        cancel = [o.id for o in ctx.open_orders]  # entries/stops are re-issued every bar
+        feat = self.planner.features(ctx.history)
+        if not self.planner.ready(feat):
+            return [], cancel
+        close = float(feat["close"].iloc[-1])
+        hs = close * self.spread_bps / 20_000
+        if ctx.position > 0:
+            if self.state is None:  # should not happen; protect anyway
+                self.state = TradeState("momentum", ctx.avg_cost, ctx.avg_cost * 0.95, ctx.avg_cost * 1.1, close,
+                                        2.5, 1.0)
+            d = self.planner.exit_decision(feat, self.state, close - hs)
+            if d.exit:
+                return [BtOrder("sell", "market", ctx.position, tag="exit")], cancel
+            return [BtOrder("sell", "stop", ctx.position, self.state.active_stop, tag="stop"),
+                    BtOrder("sell", "limit", ctx.position, self.state.take_profit, tag="tp")], cancel
+        if ctx.index < self.cooldown_until:
+            return [], cancel
+        cands, _ = self.planner.candidates({"X": feat}, set())
+        if not cands:
+            return [], cancel
+        sig = cands[0]
+        price = close + hs
+        qty = self.planner.size(sig, max_risk_usd=self.max_risk, available=ctx.cash, max_notional=self.max_order,
+                                market=self.market, price=price)
+        if qty <= 0:
+            return [], cancel
+        stop = price - sig.risk_per_unit
+        self.pending = (sig.strategy, stop, price + (sig.take_profit - sig.entry), sig.trailing_atr_multiplier,
+                        sig.trailing_activation_r, sig.level)
+        return [BtOrder("buy", "market", qty, tag=f"entry:{sig.strategy}")], cancel
 
 
 class TrendBacktest:

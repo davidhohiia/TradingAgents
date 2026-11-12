@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from trinity.bots.base import BaseBot
-from trinity.bots.crypto_grid.bot import CryptoGridBot
+from trinity.bots.crypto_momentum.bot import CryptoMomentumBot
 from trinity.bots.stock_trend.bot import StockTrendBot
 from trinity.core.log import redact, register_secret
 from trinity.core.market_calendar import UsEquityCalendar
@@ -22,9 +22,10 @@ STRANGER = 999
 
 def make_pm(system, config, extra_bots=None):
     notifier = LogNotifier()
-    grid = CryptoGridBot(config.strategies.crypto_grid, gateway=OrderGateway(system.engine, "crypto_grid", "crypto"),
-                         market=system.crypto_market, repo=system.repo, mode=Mode.PAPER, clock=system.clock,
-                         notifier=notifier)
+    grid = CryptoMomentumBot(config.strategies.crypto_momentum, config,
+                             gateway=OrderGateway(system.engine, "crypto_momentum", "crypto"),
+                             market=system.crypto_market, repo=system.repo, mode=Mode.PAPER, clock=system.clock,
+                             notifier=notifier)
     stock = StockTrendBot(config.strategies.stock_trend, config, UsEquityCalendar(config.session),
                           gateway=OrderGateway(system.engine, "stock_trend", "stocks"), market=system.stocks,
                           repo=system.repo, mode=Mode.PAPER, clock=system.clock, notifier=notifier)
@@ -61,20 +62,41 @@ async def test_pm_runs_bots_and_tracks_equity(system, config):
     assert system.repo.equity_history(Mode.PAPER)
     assert pm.last_equity is not None and pm.last_equity == pytest.approx(500, abs=10)
     health = {r["strategy_id"]: r["status"] for r in system.repo.list_bot_health()}
-    assert health["crypto_grid"] == "PAPER MODE"
+    assert health["crypto_momentum"] == "PAPER MODE"
     bal = pm.balance_data()
-    assert bal["reserve"] == 200 and set(bal["strategies"]) >= {"crypto_grid", "stock_trend", "arbitrage"}
+    assert bal["reserve"] == 250 and bal["contributed"] == 500 and set(bal["strategies"]) >= {"crypto_momentum", "stock_trend", "arbitrage"}
     assert bal["strategies"]["arbitrage"]["available"] == 0
+
+
+async def resting_buy(system):
+    """A deterministic resting entry order (bots may legitimately find no signal)."""
+    b = await system.crypto_market.fetch_order_book("BTC/USDT")
+    px = round(b.best_bid * 0.98, 2)
+    res = await system.engine.submit(OrderIntent(
+        strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY, order_type=OrderType.LIMIT,
+        quantity=0.0003, reference_price=b.best_ask, price=px, stop_price=px * 0.98, market_data_ts=b.ts,
+        asset_class=AssetClass.CRYPTO))
+    assert res.accepted, res.reasons
+
+
+async def market_buy(system, symbol="ETH/USDT", qty=0.005):
+    b = await system.crypto_market.fetch_order_book(symbol)
+    res = await system.engine.submit(OrderIntent(
+        strategy_id="crypto_momentum", venue="crypto", symbol=symbol, side=Side.BUY, order_type=OrderType.MARKET,
+        quantity=qty, reference_price=b.best_ask, stop_price=b.best_ask * 0.97, market_data_ts=b.ts,
+        asset_class=AssetClass.CRYPTO))
+    assert res.accepted, res.reasons
 
 
 async def test_daily_loss_reaction_cancels_buys_and_notifies(system, config):
     pm, notifier = make_pm(system, config)
     await pm.start()
     await run_for(pm, system, 600)
+    await resting_buy(system)
     assert [o for o in system.repo.list_active_orders(Mode.PAPER) if o.side == Side.BUY]
-    # simulate a realized loss of $12 today on the books
+    # simulate a realized loss of $16 today on the books (3% of 500 = 15)
     p = system.positions.get("stock_trend", "stocks", "SPY")
-    p.realized_pnl -= 12.0
+    p.realized_pnl -= 16.0
     await pm.monitor()
     assert "daily_loss_lock" in system.risk.blocking_locks()
     assert not [o for o in system.repo.list_active_orders(Mode.PAPER) if o.side == Side.BUY]
@@ -85,14 +107,18 @@ async def test_drawdown_lock_cancels_all_and_keeps_positions(system, config):
     pm, notifier = make_pm(system, config)
     await pm.start()
     await run_for(pm, system, 1200)
+    await market_buy(system)
+    await resting_buy(system)
     open_before = [p.symbol for p in system.positions.all(open_only=True)]
+    assert open_before
     p = system.positions.get("stock_trend", "stocks", "SPY")
-    p.realized_pnl -= 45.0  # equity -9%
+    p.realized_pnl -= 80.0  # equity -16% -> 15% live lock
     await pm.monitor()
     assert "drawdown_lock" in system.risk.blocking_locks()
     assert system.repo.list_active_orders(Mode.PAPER) == []
     assert [p.symbol for p in system.positions.all(open_only=True)] == open_before  # no forced liquidation
-    assert any("drawdown" in t.lower() for _, t, _ in notifier.sent)
+    msgs = [t for e, t, _ in notifier.sent if e == "risk_limit"]
+    assert any("Drawdown" in t and "ETH/USDT" in t and "NOT liquidated" in t for t in msgs)  # detailed message
 
 
 async def test_telegram_rejects_strangers(system, config):
@@ -111,7 +137,7 @@ async def test_telegram_commands_for_owner(system, config):
     await run_for(pm, system, 300)
     tg, _ = telegram(pm)
     for cmd in ("/start", "/status", "/balance", "/pnl", "/positions", "/trades", "/grid", "/stocks", "/arbitrage",
-                "/risk", "/report", "/paper", "/live_status"):
+                "/risk", "/report", "/paper", "/live_status", "/capital", "/strategies", "/crypto"):
         reply = await tg.execute(cmd)
         assert reply and "Command failed" not in reply, (cmd, reply)
     assert "PAPER" in await tg.execute("/status")
@@ -129,7 +155,7 @@ async def test_telegram_emergency_stop_and_resume_cannot_bypass(system, config):
     assert system.repo.list_active_orders(Mode.PAPER) == []
     b = await system.crypto_market.fetch_order_book("BTC/USDT")
     res = await system.engine.submit(OrderIntent(
-        strategy_id="crypto_grid", venue="crypto", symbol="BTC/USDT", side=Side.BUY, order_type=OrderType.MARKET,
+        strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY, order_type=OrderType.MARKET,
         quantity=0.0002, reference_price=b.best_ask, market_data_ts=b.ts, asset_class=AssetClass.CRYPTO,
         stop_price=b.best_ask * 0.97))
     assert not res.accepted
@@ -197,18 +223,18 @@ async def test_supervisor_restarts_then_stops_failing_bot(system, config):
             break
     assert pm.restarts["exploder"] >= MAX_BOT_RESTARTS and not bad.running
     assert any(e == "bot_stopped" for e, _, _ in notifier.sent)
-    assert pm.bots["crypto_grid"].running  # other bots unaffected
+    assert pm.bots["crypto_momentum"].running  # other bots unaffected
 
 
 async def test_gateway_cannot_act_for_other_strategy(system):
-    gw = OrderGateway(system.engine, "crypto_grid", "crypto")
+    gw = OrderGateway(system.engine, "crypto_momentum", "crypto")
     b = await system.crypto_market.fetch_order_book("BTC/USDT")
     with pytest.raises(StrategyMismatch):
         await gw.submit(OrderIntent(strategy_id="stock_trend", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
                                     order_type=OrderType.MARKET, quantity=0.0002, reference_price=b.best_ask,
                                     market_data_ts=b.ts, asset_class=AssetClass.CRYPTO))
     other = OrderGateway(system.engine, "stock_trend", "stocks")
-    res = await gw.submit(OrderIntent(strategy_id="crypto_grid", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
+    res = await gw.submit(OrderIntent(strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
                                       order_type=OrderType.MARKET, quantity=0.0002, reference_price=b.best_ask,
                                       market_data_ts=b.ts, asset_class=AssetClass.CRYPTO, stop_price=b.best_ask * 0.97))
     assert not await other.cancel(res.client_order_id)

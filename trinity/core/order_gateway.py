@@ -68,6 +68,18 @@ class OrderGateway:
     def max_risk_per_trade_pct(self) -> float:
         return self._engine.config.risk.max_risk_per_trade_pct
 
+    def max_trade_risk_usd(self) -> float:
+        """0.75% of account equity, halved in the 12% drawdown tier (set by the Risk Manager only)."""
+        return self._engine.risk.max_trade_risk_usd(self._engine.account_equity())
+
+    def update_correlations(self, matrix: dict[tuple[str, str], float]) -> None:
+        """Market data input for the Risk Manager's dynamic correlation check (cannot change limits)."""
+        self._engine.risk.update_correlations(matrix)
+
+    def open_positions_all(self) -> list[Position]:
+        """All open positions of ALL strategies (read-only; used to avoid duplicate risk)."""
+        return self._engine.positions.all(open_only=True)
+
     def risk_locked(self) -> list[str]:
         return self._engine.risk.blocking_locks()
 

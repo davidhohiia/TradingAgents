@@ -113,3 +113,12 @@ async def test_bot_scan_only_never_uses_execution(tmp_path):
     srcs["x"].outages = srcs["y"].outages = srcs["z"].outages = [(clock.now(), clock.now() + timedelta(hours=1))]
     assert not await bot.safe_step()
     assert bot.status() == BotStatus.CONNECTION_ERROR
+
+
+def test_data_delay_control_rejects_slow_snapshots():
+    opps = ArbitrageScanner(cfg()).evaluate("BTC/USDT", {"a": ob("a", 59900, 60000), "b": ob("b", 60600, 60700)}, NOW,
+                                           latencies_ms={"a": 50, "b": 4000})
+    assert all(any("data delay on b" in r for r in o.reasons) for o in opps)
+    ok = ArbitrageScanner(cfg()).evaluate("BTC/USDT", {"a": ob("a", 59900, 60000), "b": ob("b", 60600, 60700)}, NOW,
+                                         latencies_ms={"a": 50, "b": 60})
+    assert any(o.accepted for o in ok)

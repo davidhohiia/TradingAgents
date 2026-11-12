@@ -57,7 +57,8 @@ def main() -> None:
         return
     mode = st.sidebar.radio("Mode", ["paper", "live"], index=0,
                             help="Paper (virtual) and live (real) data are always shown separately.")
-    page = st.sidebar.radio("Page", ["Overview", "Crypto Grid", "Stock Trend", "Arbitrage", "Risk", "System"])
+    page = st.sidebar.radio("Page", ["Overview", "Crypto Momentum", "Stock Trend", "Arbitrage", "Capital",
+                                     "Strategies", "Risk", "System"])
     st.sidebar.button("Refresh")
     if mode == "paper":
         st.info("🧪 PAPER MODE — all figures are VIRTUAL (simulated execution). They are not real money results.")
@@ -65,8 +66,12 @@ def main() -> None:
         st.error("🔴 LIVE MODE view — real money accounts.")
     if page == "Overview":
         overview(repo, config, mode)
-    elif page == "Crypto Grid":
-        bot_page(repo, "crypto_grid", mode)
+    elif page == "Crypto Momentum":
+        bot_page(repo, "crypto_momentum", mode)
+    elif page == "Capital":
+        capital_page(repo, config, mode)
+    elif page == "Strategies":
+        strategies_page(repo, mode)
     elif page == "Stock Trend":
         bot_page(repo, "stock_trend", mode)
     elif page == "Arbitrage":
@@ -80,7 +85,7 @@ def main() -> None:
 def overview(repo: Repository, config, mode: str) -> None:  # noqa: ANN001
     eq = df_rows(repo.query("SELECT * FROM equity_history WHERE mode=? ORDER BY id", (mode,)))
     pos = df_rows(repo.query("SELECT * FROM positions WHERE mode=? AND quantity>1e-12", (mode,)))
-    total = config.capital.total_capital_usd
+    contributed = repo.query("SELECT COALESCE(SUM(amount_usd), 0) FROM deposits")[0][0] or config.capital.total_capital_usd
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     if not eq.empty:
         last = eq.iloc[-1]
@@ -92,7 +97,7 @@ def overview(repo: Repository, config, mode: str) -> None:  # noqa: ANN001
         c2.metric("Cash (not invested)", f"${last['cash']:,.2f}")
         c3.metric("Invested", f"${last['invested']:,.2f}")
         c4.metric("Day PnL", f"${last['equity'] - day_start:+,.2f}")
-        c5.metric("Total PnL", f"${last['equity'] - total:+,.2f}")
+        c5.metric("Trading profit (excl. deposits)", f"${last['equity'] - contributed:+,.2f}")
         peak = eq["equity"].cummax()
         c6.metric("Max drawdown", f"{((peak - eq['equity']) / peak).max():.2%}")
         st.subheader("Equity curve" + (" (VIRTUAL)" if mode == "paper" else ""))
@@ -107,8 +112,10 @@ def overview(repo: Repository, config, mode: str) -> None:  # noqa: ANN001
             st.markdown(f"**{r['strategy_id']}** {badge(r['status'])} &nbsp; last heartbeat {r['last_heartbeat']}"
                         + (f" — `{r['last_error']}`" if r["last_error"] else ""), unsafe_allow_html=True)
     st.subheader("Capital allocation")
-    alloc = dict(config.capital.allocations)
-    alloc["reserve (locked)"] = config.capital.reserve_usd
+    state = repo.get_kv("capital:allocations") or {"strategies": dict(config.capital.allocations),
+                                                    "reserve": config.capital.reserve_usd}
+    alloc = dict(state["strategies"])
+    alloc["reserve (never auto-used)"] = state["reserve"]
     st.bar_chart(pd.Series(alloc, name="USD"))
     st.subheader("Open positions")
     st.dataframe(pos[["strategy_id", "symbol", "quantity", "avg_entry_price", "last_price", "unrealized_pnl",
@@ -168,23 +175,89 @@ def arbitrage_page(repo: Repository) -> None:
 def risk_page(repo: Repository, config, mode: str) -> None:  # noqa: ANN001
     st.header("Risk")
     state = repo.get_kv(f"risk:{mode}:state") or {}
-    locks = [k for k in ("emergency_stop", "recovery_lock", "drawdown_lock", "paused") if state.get(k)]
+    locks = [k for k in ("emergency_stop", "hard_stop", "recovery_lock", "drawdown_lock", "paused") if state.get(k)]
     if state.get("daily_lock_day") == datetime.now(UTC).strftime("%Y-%m-%d"):
         locks.append("daily_loss_lock")
     st.markdown(badge("RISK LOCKED") if locks else badge("PAPER MODE" if mode == "paper" else "LIVE MODE"),
                 unsafe_allow_html=True)
     st.write("Active locks:", locks or "none", state.get("reasons", {}))
     r = config.risk
+    eqs = repo.get_kv(f"risk:{mode}:equity_state") or {}
+    peak = eqs.get("peak")
+    st.write(f"Equity peak (deposit-adjusted): {peak}  |  max drawdown seen: {eqs.get('max_dd', 0):.2%}")
     st.table(pd.DataFrame({
-        "limit": ["max daily loss", "max drawdown", "max total exposure", "max risk per trade", "max order"],
-        "value": [f"{r.max_daily_loss_pct:.1%} (${r.max_daily_loss_pct * config.capital.total_capital_usd:.0f})",
-                  f"{r.max_drawdown_pct:.1%}",
-                  f"{r.max_total_exposure_pct:.0%} (${r.max_total_exposure_pct * config.capital.total_capital_usd:.0f})",
-                  f"{r.max_risk_per_trade_pct:.1%} of strategy capital", f"${r.max_order_notional_usd:.0f}"]}))
+        "limit": ["risk per trade", "total open risk", "daily loss", "weekly loss", "DD warning", "DD reduced activity",
+                  "DD live lock (manual confirm)", "DD hard stop (absolute)", "max total exposure", "max order",
+                  "leverage"],
+        "value": [f"{r.max_risk_per_trade_pct:.2%} of equity", f"{r.max_total_open_risk_pct:.0%} of equity",
+                  f"{r.max_daily_loss_pct:.0%} of day-start equity", f"{r.max_weekly_loss_pct:.0%} of week-start equity",
+                  f"{r.drawdown_warning_pct:.0%}", f"{r.drawdown_reduce_pct:.0%} (risk x{r.reduced_activity_multiplier})",
+                  f"{r.drawdown_live_lock_pct:.0%}", f"{r.drawdown_emergency_pct:.0%}",
+                  f"{r.max_total_exposure_pct:.0%} of equity", f"${r.max_order_notional_usd:.0f}",
+                  "OFF" if not config.leverage.enabled else f"gated, isolated, max {config.leverage.max_leverage}x"]}))
     st.subheader("Risk events")
     ev = df_rows(repo.query("SELECT ts, severity, event_type, strategy_id, symbol, message FROM risk_events "
                             "WHERE mode=? ORDER BY id DESC LIMIT 300", (mode,)))
     st.dataframe(ev, use_container_width=True)
+
+
+def capital_page(repo: Repository, config, mode: str) -> None:  # noqa: ANN001
+    st.header("Capital growth")
+    st.caption(f"Informational monthly target {config.capital.informational_monthly_target_pct:.0%} — "
+               "NOT a trading goal, never used to open trades. No return is guaranteed.")
+    deps = df_rows(repo.list_deposits())
+    contributed = float(deps["amount_usd"].sum()) if not deps.empty else config.capital.total_capital_usd
+    eq = df_rows(repo.query("SELECT ts, equity FROM equity_history WHERE mode=? ORDER BY id", (mode,)))
+    equity = float(eq["equity"].iloc[-1]) if not eq.empty else contributed
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Contributed capital", f"${contributed:,.2f}")
+    c2.metric("Equity" + (" (virtual)" if mode == "paper" else ""), f"${equity:,.2f}")
+    c3.metric("Trading profit (deposits excluded)", f"${equity - contributed:+,.2f}")
+    state = repo.get_kv("capital:allocations") or {}
+    st.subheader("Current allocation")
+    st.json(state)
+    st.subheader("Deposits (never counted as income)")
+    st.dataframe(deps, use_container_width=True)
+    if not eq.empty:
+        from trinity.core.capital_growth import CapitalGrowthManager
+
+        pts = [(datetime.fromisoformat(t), float(v)) for t, v in zip(eq["ts"], eq["equity"], strict=True)]
+        months = CapitalGrowthManager.monthly_returns(_GrowthView(repo, config), pts)
+        st.subheader("Monthly returns (Modified Dietz, deposits excluded)")
+        st.dataframe(pd.DataFrame(months), use_container_width=True)
+    st.subheader("Reallocation proposals (approval only via scripts/capital.py)")
+    st.dataframe(df_rows(repo.query("SELECT * FROM reallocation_proposals ORDER BY id DESC")), use_container_width=True)
+    st.subheader("Allocation history")
+    st.dataframe(df_rows(repo.query("SELECT * FROM capital_allocations ORDER BY id DESC")), use_container_width=True)
+
+
+class _GrowthView:
+    """Read-only adapter so the dashboard can reuse the Modified Dietz calculation."""
+
+    def __init__(self, repo: Repository, config) -> None:  # noqa: ANN001
+        self.repo, self.config = repo, config
+
+
+def strategies_page(repo: Repository, mode: str) -> None:
+    from trinity.ai.performance_analyzer import StrategyAnalytics
+
+    st.header("Strategy statistics" + (" (VIRTUAL)" if mode == "paper" else ""))
+    sa = StrategyAnalytics(repo)
+    st.dataframe(pd.DataFrame(sa.per_sub_strategy(Mode(mode))).T, use_container_width=True)
+    st.subheader("Real vs virtual (never mixed)")
+    for sid in ("crypto_momentum", "stock_trend"):
+        rv = sa.real_vs_virtual(sid)
+        st.write(sid, pd.DataFrame({"paper (virtual)": rv["paper_virtual"], "live (real)": rv["live_real"]}),
+                 rv["flags"])
+    st.subheader("Degradation flags")
+    st.json(repo.get_kv(f"analytics:{mode}:degraded") or {})
+    st.subheader("Strategy PnL correlation")
+    st.json(repo.get_kv(f"analytics:{mode}:strategy_correlation") or {})
+    st.subheader("Exchange API health")
+    st.dataframe(df_rows(repo.query("SELECT * FROM api_health ORDER BY id DESC LIMIT 200")), use_container_width=True)
+    st.subheader("Funding payments (leveraged positions only)")
+    st.dataframe(df_rows(repo.query("SELECT * FROM funding_payments ORDER BY id DESC LIMIT 200")),
+                 use_container_width=True)
 
 
 def system_page(repo: Repository) -> None:

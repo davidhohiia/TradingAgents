@@ -1,0 +1,15 @@
+.env
+data/*.db
+data/*.db-*
+data/*.lock
+data/backups/
+data/csv/
+data/test_results.json
+data/sim_24h_report.json
+logs/*
+!logs/.gitkeep
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/

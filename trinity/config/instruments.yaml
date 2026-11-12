@@ -1,0 +1,102 @@
+# Instrument metadata.
+# In LIVE mode precision/minimums are loaded from the venue (exchange markets / broker assets)
+# and these values are only used as a fallback for paper trading and backtests.
+# Fees are ESTIMATES - verify your real fee tier.
+
+instruments:
+  BTC/USDT:
+    asset_class: crypto
+    base: BTC
+    quote: USDT
+    correlation_group: crypto_major
+    qty_step: 0.00001
+    price_step: 0.01
+    min_qty: 0.00001
+    min_notional: 5
+    maker_fee: 0.001
+    taker_fee: 0.001
+  ETH/USDT:
+    asset_class: crypto
+    base: ETH
+    quote: USDT
+    correlation_group: crypto_major
+    qty_step: 0.0001
+    price_step: 0.01
+    min_qty: 0.0001
+    min_notional: 5
+    maker_fee: 0.001
+    taker_fee: 0.001
+  SPY:
+    asset_class: stock
+    base: SPY
+    quote: USD
+    correlation_group: us_equity_broad
+    qty_step: 0.0001        # fractional; whole shares (1) are used if the broker/asset is not fractionable
+    price_step: 0.01
+    min_qty: 0.0001
+    min_notional: 1
+    maker_fee: 0.0
+    taker_fee: 0.0
+    sell_regulatory_fee_pct: 0.0000278   # ESTIMATE of SEC/FINRA sell-side fees; verify
+  QQQ:
+    asset_class: stock
+    base: QQQ
+    quote: USD
+    correlation_group: us_equity_broad
+    qty_step: 0.0001
+    price_step: 0.01
+    min_qty: 0.0001
+    min_notional: 1
+    maker_fee: 0.0
+    taker_fee: 0.0
+    sell_regulatory_fee_pct: 0.0000278
+  VTI:
+    asset_class: stock
+    base: VTI
+    quote: USD
+    correlation_group: us_equity_broad
+    qty_step: 0.0001
+    price_step: 0.01
+    min_qty: 0.0001
+    min_notional: 1
+    maker_fee: 0.0
+    taker_fee: 0.0
+    sell_regulatory_fee_pct: 0.0000278
+
+# US equity session (used when the broker calendar API is unavailable).
+# The broker's own clock/calendar endpoint always takes precedence.
+us_equity_session:
+  timezone: America/New_York
+  open: "09:30"
+  close: "16:00"
+  early_close: "13:00"
+  # VERIFY against the official NYSE holiday calendar before relying on this list.
+  holidays:
+    - "2026-01-01"
+    - "2026-01-19"
+    - "2026-02-16"
+    - "2026-04-03"
+    - "2026-05-25"
+    - "2026-06-19"
+    - "2026-07-03"
+    - "2026-09-07"
+    - "2026-11-26"
+    - "2026-12-25"
+    - "2027-01-01"
+    - "2027-01-18"
+    - "2027-02-15"
+    - "2027-03-26"
+    - "2027-05-31"
+    - "2027-06-18"
+    - "2027-07-05"
+    - "2027-09-06"
+    - "2027-11-25"
+    - "2027-12-24"
+  early_closes:
+    - "2026-11-27"
+    - "2026-12-24"
+    - "2027-11-26"
+
+currency:
+  # USDT is treated as USD at this rate. Stablecoins can de-peg: this is a known limitation.
+  usdt_usd_rate: 1.0

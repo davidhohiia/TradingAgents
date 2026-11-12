@@ -1,0 +1,141 @@
+# TRINITY strategy, capital and risk configuration.
+# All monetary values are in USD (internal settlement currency).
+# Changing these values changes REAL risk once live trading is enabled. Read RISK_POLICY.md.
+
+capital:
+  total_capital_usd: 500
+  allocations:
+    crypto_grid: 150
+    stock_trend: 150
+    arbitrage: 0          # arbitrage is scan + virtual only
+  reserve_usd: 200        # never used automatically for trading
+  # Profits never increase the trading budget automatically. Losses reduce it.
+  allow_profit_reinvestment: false
+
+risk:
+  leverage: 0                       # 0 = no leverage. Any other value is rejected.
+  allow_margin: false
+  allow_short: false
+  max_risk_per_trade_pct: 0.01      # 1% of the strategy's capital (allowed range 0.5%..1%)
+  min_risk_per_trade_pct: 0.005
+  max_daily_loss_pct: 0.02          # 2% of INITIAL total capital -> $10
+  max_drawdown_pct: 0.08            # 8% from equity peak -> lock, manual confirmation required
+  drawdown_warning_pct: 0.05
+  max_total_exposure_pct: 0.60      # 60% of initial capital -> $300 incl. pending buy orders
+  max_order_notional_usd: 75
+  min_order_notional_usd: 5
+  max_position_pct_of_strategy: 0.60
+  max_open_positions: 6
+  max_open_orders: 30
+  max_correlated_exposure_pct: 0.30 # per correlation group, of initial capital -> $150
+  max_price_age_seconds:
+    crypto: 30
+    stock: 180
+  api_failure_threshold: 5          # consecutive failures before circuit breaker opens
+  api_cooldown_seconds: 120
+  max_orders_per_minute: 20         # runaway-loop protection
+
+paper:
+  # Minimum validation before live trading may even be considered. These are NOT a
+  # guarantee of future returns.
+  min_days: 30
+  min_closed_trades: 100
+  require_paper_validation: true
+  initial_balances:
+    paper_crypto:
+      USDT: 150
+    paper_stocks:
+      USD: 150
+  simulation:
+    taker_slippage_bps: 5           # extra slippage on top of walking the book
+    limit_fill_ratio: 0.5           # max share of remaining qty filled per matching pass
+    stock_spread_bps: 2             # used only when no real quote is available
+    seed: 42
+
+strategies:
+  crypto_grid:
+    enabled: true
+    strategy_id: crypto_grid
+    venue: crypto                   # logical venue name, see settings CRYPTO_EXCHANGE_ID
+    symbols: [BTC/USDT, ETH/USDT]
+    timeframe: 15m
+    history_bars: 300
+    loop_interval_seconds: 30
+    grid:
+      levels: 3                     # buy levels below mid
+      level_notional_usd: 20        # FIXED size per level (no martingale, never increased after losses)
+      atr_period: 14
+      atr_spacing_multiplier: 0.6
+      min_spacing_pct: 0.006
+      max_spacing_pct: 0.03
+      max_inventory_usd_per_symbol: 60   # stops accumulation during falls
+      stop_atr_multiplier: 2.0      # grid stop = lowest level - k*ATR
+      stop_cooldown_minutes: 240
+      rebuild_drift_spacings: 1.5   # rebuild if mid drifts this many spacings from grid centre
+      rebuild_atr_change_pct: 0.35  # rebuild if ATR changed by 35%
+      max_order_age_minutes: 240
+      min_net_profit_usd: 0.05
+      min_net_profit_pct: 0.001
+      adverse_spread_buffer: 0.5    # fraction of the spread charged as expected cost
+    regime:
+      trend_period: 50
+      adx_period: 14
+      adx_trend_threshold: 25
+      strong_bear_slope_pct: -0.02  # EMA(50) change over lookback
+      slope_lookback: 20
+      high_vol_atr_pct: 0.04
+      allowed_regimes: [ranging, bull]
+
+  stock_trend:
+    enabled: true
+    strategy_id: stock_trend
+    venue: stocks
+    symbols: [SPY, QQQ, VTI]
+    timeframe: 1Day
+    history_bars: 260
+    loop_interval_seconds: 60
+    ema_fast: 20
+    ema_slow: 50
+    rsi_period: 14
+    rsi_min: 45
+    rsi_max: 70
+    atr_period: 14
+    volume_lookback: 20
+    min_up_down_volume_ratio: 1.0
+    min_avg_dollar_volume: 50000000
+    stop_atr_multiplier: 2.0
+    take_profit_r: 2.5
+    trailing_atr_multiplier: 3.0
+    trailing_activation_r: 1.0
+    min_reward_risk: 1.5
+    max_positions: 2
+    entry_limit_offset_bps: 10      # marketable limit = ask * (1 + offset)
+    max_spread_bps: 20
+    allow_fractional: true          # used only if broker AND asset support it
+
+  arbitrage:
+    enabled: true
+    strategy_id: arbitrage
+    mode: scan_only                 # the only supported mode. Real execution is not implemented.
+    exchanges: []                   # filled from ARB_EXCHANGE_IDS in .env
+    symbols: [BTC/USDT, ETH/USDT]
+    loop_interval_seconds: 10
+    trade_size_usd: 100
+    orderbook_depth: 20
+    min_net_profit_usd: 0.10
+    min_net_profit_bps: 5
+    slippage_bps: 5
+    max_quote_age_ms: 3000
+    max_clock_skew_ms: 2000
+    assumed_latency_ms: 500
+    max_execution_risk_usd: 0.50
+    volatility_per_second_bps: 2.0  # used to price latency risk
+    transfer_amortization_trades: 10
+    transfer_fees:                  # ESTIMATES in asset units. Verify on each exchange.
+      BTC: 0.0002
+      ETH: 0.002
+      USDT: 1.0
+    taker_fees:                     # ESTIMATES. Verify your fee tier on each exchange.
+      default: 0.001
+    # VIRTUAL inventory only: split per exchange into USDT + each base asset (3 x 3 x $200).
+    virtual_capital_usd: 1800

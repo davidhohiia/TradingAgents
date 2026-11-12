@@ -1,0 +1,22 @@
+# Build from the REPOSITORY ROOT:  docker compose -f trinity/docker-compose.yml up -d --build
+services:
+  engine:
+    build:
+      context: ..
+      dockerfile: trinity/Dockerfile
+    env_file: .env
+    volumes:
+      - ./data:/app/trinity/data
+      - ./logs:/app/trinity/logs
+    restart: unless-stopped   # restarts always come back in PAPER mode
+  dashboard:
+    build:
+      context: ..
+      dockerfile: trinity/Dockerfile
+    command: ["streamlit", "run", "trinity/dashboard/app.py", "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true"]
+    env_file: .env
+    volumes:
+      - ./data:/app/trinity/data   # opened read-only by the app; WAL needs the -shm file
+    ports:
+      - "127.0.0.1:8501:8501"   # local only
+    restart: unless-stopped

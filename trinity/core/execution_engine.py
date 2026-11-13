@@ -371,7 +371,8 @@ class ExecutionEngine:
                         fill.quantity = min(fill.quantity, pos.quantity)
                     fill.realized_pnl = self.positions.apply_fill(
                         fill, exit_reason=record.reason, sub_strategy=record.sub_strategy, leverage=record.leverage,
-                        stop_price=record.stop_price, take_profit=record.take_profit)
+                        stop_price=record.stop_price, take_profit=record.take_profit,
+                        unsellable_qty=max(market.qty_step, market.min_qty))
                     self.repo.insert_execution(fill)
                     realized_total += fill.realized_pnl
                     fills.append(fill)

@@ -8,8 +8,10 @@ from trinity.config.settings import AppConfig
 from trinity.core.log import get_logger
 from trinity.core.models import Fill, Mode, Position, Side
 from trinity.database.repository import Repository
+from trinity.integrations.sheets.journal import TradeCycle, close_cycle
 
 log = get_logger(__name__)
+DUST_USD = 0.01  # a remainder worth less than 1 cent (fee-in-base rounding) closes the trade cycle
 
 EPS = 1e-12
 
@@ -49,7 +51,8 @@ class PositionManager:
         return [p for p in self.all(True) if strategy_id is None or p.strategy_id == strategy_id]
 
     def apply_fill(self, fill: Fill, exit_reason: str = "", sub_strategy: str = "", leverage: float = 1.0,
-                   stop_price: float | None = None, take_profit: float | None = None) -> float:
+                   stop_price: float | None = None, take_profit: float | None = None,
+                   unsellable_qty: float = 0.0) -> float:
         """Update the position for a fill. Returns realized PnL (net of fees) of this fill.
 
         Must be called inside the same DB transaction that stores the execution.
@@ -57,6 +60,13 @@ class PositionManager:
         p = self.get(fill.strategy_id, fill.venue, fill.symbol)
         realized = 0.0
         if fill.side == Side.BUY:
+            if p.cycle is None:  # first entry of a new trade cycle
+                p.cycle = TradeCycle(opened_at=fill.ts.isoformat(), first_entry_order=fill.client_order_id,
+                                     sub_strategy=sub_strategy, leverage=max(leverage, 1.0)).to_dict()
+            cyc = TradeCycle.from_dict(p.cycle)
+            assert cyc is not None
+            cyc.add_entry(fill.quantity, fill.price, fill.fee_usd, fill.client_order_id)
+            p.cycle = cyc.to_dict()
             new_qty = p.quantity + fill.quantity
             cost = p.quantity * p.avg_entry_price + fill.quantity * fill.price + fill.fee_usd
             p.avg_entry_price = cost / new_qty
@@ -93,6 +103,7 @@ class PositionManager:
                 p.take_profit = None
                 p.liquidation_price = None
             p.realized_pnl += realized
+            self._journal_exit(p, fill, qty, exit_reason, unsellable_qty)
             self.repo.upsert_trade_fill(
                 strategy_id=fill.strategy_id, venue=fill.venue, symbol=fill.symbol, mode=fill.mode,
                 quantity=qty, entry_price=entry_price, exit_price=fill.price, entry_time=entry_time,
@@ -106,6 +117,23 @@ class PositionManager:
         self.repo.upsert_position(p)
         return realized
 
+    def _journal_exit(self, p: Position, fill: Fill, qty: float, reason: str, unsellable_qty: float = 0.0) -> None:
+        """Merge exit fills into the trade cycle; journal the trade once the position is flat."""
+        cyc = TradeCycle.from_dict(p.cycle)
+        if cyc is None:
+            log.warning("exit fill without a recorded trade cycle (%s %s): not journaled", p.strategy_id, p.symbol)
+            return
+        cyc.add_exit(qty, fill.price, fill.fee_usd, fill.client_order_id, reason, fill.ts)
+        # remainder below the venue's lot step cannot be sold (fee charged in the base asset): trade is closed
+        dust = p.quantity * fill.price < DUST_USD or p.quantity < unsellable_qty - 1e-15
+        if p.quantity <= 1e-10 or dust:
+            trade = close_cycle(cyc, mode=fill.mode.value, strategy_id=p.strategy_id, venue=p.venue, symbol=p.symbol)
+            if not self.repo.insert_journal_trade(trade.to_dict(), fill.ts):
+                log.warning("journal trade %s already recorded", trade.trade_id)
+            p.cycle = None
+        else:
+            p.cycle = cyc.to_dict()
+
     def set_protection(self, strategy_id: str, venue: str, symbol: str,
                        stop: float | None, take_profit: float | None) -> None:
         p = self.get(strategy_id, venue, symbol)
@@ -118,6 +146,10 @@ class PositionManager:
         p = self.get(strategy_id, venue, symbol)
         p.funding_paid += amount_usd
         p.realized_pnl -= amount_usd
+        cyc = TradeCycle.from_dict(p.cycle)
+        if cyc is not None:
+            cyc.funding += amount_usd
+            p.cycle = cyc.to_dict()
         p.updated_at = ts
         self.repo.upsert_position(p)
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime
 
@@ -34,6 +35,9 @@ REQUIRED_TABLES = (
     "reallocation_proposals",
     "api_health",
     "funding_payments",
+    "journal_trades",
+    "sheets_outbox",
+    "sync_errors",
 )
 
 
@@ -100,4 +104,5 @@ def row_to_position(row: sqlite3.Row) -> Position:
         leverage=float(row["leverage"] or 1.0),
         liquidation_price=row["liquidation_price"],
         funding_paid=float(row["funding_paid"] or 0.0),
+        cycle=json.loads(row["cycle_json"]) if row["cycle_json"] else None,
     )

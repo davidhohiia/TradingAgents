@@ -6,7 +6,7 @@
 > Все результаты виртуальной торговли, бэктестов и симуляций — виртуальные и не предсказывают реальные.
 
 Быстрый старт: [QUICKSTART.md](QUICKSTART.md) · Риски: [RISK_POLICY.md](RISK_POLICY.md) ·
-Ключи API: [API_SETUP.md](API_SETUP.md) · Windows 24/7: [DEPLOYMENT_WINDOWS.md](DEPLOYMENT_WINDOWS.md)
+Ключи API: [API_SETUP.md](API_SETUP.md) · Google Sheets: [GOOGLE_SHEETS_SETUP.md](GOOGLE_SHEETS_SETUP.md) · Windows 24/7: [DEPLOYMENT_WINDOWS.md](DEPLOYMENT_WINDOWS.md)
 
 ---
 
@@ -77,7 +77,9 @@ trinity/
   dashboard/app.py        Streamlit
   scripts/                install.sh, backup.py, run_paper.py, run_live.py, emergency_stop.py, capital.py, leverage.py,
                           run_backtest.py, simulate_24h.py, windows/*.ps1|*.bat
-  tests/                  pytest (170 тестов)
+  integrations/sheets/    Google Sheets журнал: journal (P&L, объединение исполнений), client (Sheets API v4),
+                          sync (очередь, дедупликация, повторы), stats (листы статистики)
+  tests/                  pytest (191 тест)
 ```
 
 ## 3. Установка
@@ -164,7 +166,7 @@ python trinity/scripts/capital.py --approve 3                    # только 
    Без списка ID Telegram **отключается** (защита).
 
 Команды: `/start /status /balance /pnl /positions /trades /crypto (/grid) /stocks /arbitrage /risk
-/report /capital /strategies /pause /resume /stop /emergency_stop /paper /live_status`.
+/report /capital /strategies /journal /pause /resume /stop /emergency_stop /paper /live_status`.
 
 * Посторонние пользователи получают «Access denied», попытка пишется в журнал.
 * `/emergency_stop` сначала блокирует все новые ордера, затем отменяет открытые. Позиции не ликвидируются.
@@ -255,7 +257,26 @@ BTC/ETH, 1.5x, абсолютный предел 2x, проверка ликви
 Мониторинг: здоровье API бирж (задержка p50/p95, доля ошибок), автоматическое обнаружение деградации
 стратегий (только уведомления), корреляция стратегий, контроль реальной и виртуальной доходности.
 
-## 12. Устранение неисправностей
+## 11a. Журнал сделок в Google Sheets
+
+Каждая полностью закрытая сделка автоматически записывается в Google Таблицу
+**«TRINITY 3.0 — Trading Journal»** (листы Trades, Daily Statistics, Bot Statistics, Portfolio).
+SQLite остаётся основной базой: без интернета записи копятся в локальной очереди и отправляются
+при восстановлении связи, без дублей (у каждой сделки уникальный ID). Частичные исполнения
+объединяются в одну сделку; P&L — по фактическим исполнениям и комиссиям; время — Europe/Amsterdam.
+
+Быстрая настройка (подробно — [GOOGLE_SHEETS_SETUP.md](GOOGLE_SHEETS_SETUP.md)):
+1. Google Cloud Console → новый проект → включить **Google Sheets API**.
+2. Создать Service Account и JSON-ключ (в `trinity/secrets/`, папка вне git) **или** OAuth-клиент Desktop.
+3. Создать таблицу и дать сервисному аккаунту доступ «Редактор» (для OAuth таблица создаётся автоматически).
+4. В `.env`: `GOOGLE_SHEETS_ENABLED=true`, `GOOGLE_SHEETS_SPREADSHEET_ID=...`,
+   `GOOGLE_SERVICE_ACCOUNT_FILE=trinity/secrets/google-service-account.json`.
+5. Проверка: `python trinity/scripts/sheets.py --check`, отправка вручную: `--sync`, состояние: `--status`,
+   ошибки: `--errors`; в Telegram — `/journal`.
+
+Интеграция не меняет стратегии, лимиты риска и правила торговли; сбой Google никогда не останавливает торговлю.
+
+
 
 | Симптом | Причина / решение |
 |---|---|

@@ -182,6 +182,8 @@ async def simulate(hours: float, seed: int, tick: float, out_dir: Path) -> dict:
                                                               "allocations")},
         "per_sub_strategy": app.pm.performance.per_sub_strategy(Mode.PAPER),
         "database": str(settings.database_path),
+        "journal": {"closed_trades": len(repo.list_journal_trades(Mode.PAPER)), "outbox": repo.outbox_stats(),
+                    "net_pnl": round(sum(t["net_pnl"] for t in repo.list_journal_trades(Mode.PAPER)), 4)},
     }
     await app.pm.stop()
     out_dir.mkdir(parents=True, exist_ok=True)

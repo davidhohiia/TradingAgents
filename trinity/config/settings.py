@@ -68,6 +68,15 @@ class Settings(BaseSettings):
 
     dashboard_port: int = 8501
 
+    # Google Sheets trading journal (secondary journal; SQLite stays primary)
+    google_sheets_enabled: bool = False
+    google_sheets_spreadsheet_id: str = ""
+    google_service_account_file: Path | None = None
+    google_oauth_token_file: Path | None = None
+    google_oauth_client_secret_file: Path | None = None
+    google_sheets_timezone: str = "Europe/Amsterdam"
+    google_sheets_sync_interval_seconds: float = Field(60, ge=15)
+
     @property
     def allowed_telegram_ids(self) -> set[int]:
         ids: set[int] = set()

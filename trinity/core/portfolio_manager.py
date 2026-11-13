@@ -71,6 +71,8 @@ class PortfolioManager:
         engine.allocator._allocation_fn = self.growth.allocation  # noqa: SLF001
         engine.allocator._all_fn = self.growth.allocations  # noqa: SLF001
         self.api_monitor = api_monitor
+        self.sheets: Any = None  # optional Google Sheets journal syncer (set by the app builder)
+        self.sheets_interval = 60.0
         self.restarts: dict[str, int] = dict.fromkeys(self.bots, 0)
         self._last_equity_snapshot: datetime | None = None
         self._last_report_day: str | None = repo.get_kv(f"pm:{mode.value}:last_report_day")
@@ -95,6 +97,9 @@ class PortfolioManager:
         self.scheduler.add("analytics", 3600, self.analytics, timeout=120, run_immediately=False)
         self.scheduler.add("api_health", 300, self.api_health, timeout=30, run_immediately=False)
         self.scheduler.add("funding", 3600, self.accrue_funding, timeout=60, run_immediately=False)
+        if self.sheets is not None:
+            self.scheduler.add("sheets_sync", self.sheets_interval, self.sync_sheets, timeout=180,
+                               run_immediately=False)
         self.repo.add_system_event("INFO", "portfolio", "start", f"started in {self.mode.value} mode",
                                    {"bots": list(self.bots)}, ts=self.clock.now())
         await self.notifier.notify("system", f"TRINITY started. {tpl.MODE_BANNER[self.mode.value]}")
@@ -264,6 +269,30 @@ class PortfolioManager:
                                          f"{p.symbol} price {p.last_price} within 5% of liquidation {p.liquidation_price}",
                                          strategy_id=p.strategy_id, symbol=p.symbol, ts=now)
                 await self.notifier.notify("risk_limit", f"Liquidation risk on {p.symbol}", "CRITICAL")
+
+    # ------------------------------------------------------------------ Google Sheets journal
+    async def sync_sheets(self) -> None:
+        """Send pending journal rows; failures are logged and retried on the next run (never block trading)."""
+        if self.sheets is None:
+            return
+        res = await self.sheets.sync_all()
+        if not res.ok:
+            st = self.repo.get_kv("sheets:alerted") or {}
+            day = utc_day(self.clock.now())
+            if st.get("day") != day:  # at most one alert per day
+                self.repo.set_kv("sheets:alerted", {"day": day})
+                await self.notifier.notify("sheets", f"Google Sheets sync failed ({res.errors[0][:200]}). "
+                                           f"{res.pending_left} trades kept locally and will be retried.", "WARNING")
+
+    def journal_portfolio_data(self) -> dict[str, Any]:
+        eq = self.equity_breakdown()
+        deposits = self.repo.list_deposits()
+        initial = sum(r["amount_usd"] for r in deposits if r["kind"] == "initial")
+        st = self.risk.last_status
+        return {"mode": self.mode.value, "ts": self.clock.now().isoformat(), "contributed": eq["contributed"],
+                "initial_deposit": initial, "additional_deposits": eq["contributed"] - initial,
+                "equity": eq["equity"], "cash": eq["cash"], "in_positions": eq["market_value"],
+                "drawdown_pct": st.drawdown_pct if st else None, "reserve": self.growth.reserve()}
 
     # ------------------------------------------------------------------ capital growth
     def register_deposit(self, amount: float, note: str = "", currency: str = "USD", fx_rate: float = 1.0) -> int:

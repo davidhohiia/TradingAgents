@@ -319,6 +319,7 @@ class Position:
     leverage: float = 1.0
     liquidation_price: float | None = None
     funding_paid: float = 0.0
+    cycle: dict[str, Any] | None = None  # open trade cycle (journal accumulator)
 
     @property
     def margin_used(self) -> float:

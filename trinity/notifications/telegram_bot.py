@@ -111,6 +111,12 @@ class TelegramControlCenter(Notifier):
                 return tpl.capital(pm.capital_data())
             if cmd == "/strategies":
                 return tpl.strategies(pm.strategies_data())
+            if cmd == "/journal":
+                st = pm.sheets.status() if pm.sheets else {**pm.repo.outbox_stats(), "configured": False}
+                return ("Google Sheets journal: " + ("configured" if pm.sheets else "NOT configured (kept locally)")
+                        + f"\npending {st.get('pending', 0)}, sent {st.get('sent', 0)}"
+                        + (f"\nlast success {st.get('last_success')}" if st.get("last_success") else "")
+                        + (f"\nlast error {st.get('last_error')}" if st.get("last_error") else ""))
             if cmd == "/risk":
                 return tpl.risk(pm.risk_data())
             if cmd == "/report":

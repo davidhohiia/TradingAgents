@@ -46,6 +46,8 @@ def environment_report(settings: Settings, config: AppConfig) -> list[str]:
         f"alpaca paper endpoint: {settings.alpaca_paper_account})",
         f"stock data provider: {settings.stock_data_provider}",
         f"arbitrage exchanges (public data): {', '.join(settings.arb_exchanges)}",
+        f"google sheets journal: {'enabled' if settings.google_sheets_enabled else 'disabled'}"
+        f" (credentials: {'service account' if settings.google_service_account_file else 'oauth token' if settings.google_oauth_token_file else 'none'})",
         f"telegram: {'configured' if settings.telegram_bot_token else 'NOT configured'}; "
         f"allowed ids: {len(settings.allowed_telegram_ids)}",
         f"capital: total ${config.capital.total_capital_usd}, allocations {config.capital.allocations}, "
@@ -89,6 +91,9 @@ async def run(settings: Settings, config: AppConfig, mode: Mode, max_runtime: fl
     for r in reports:
         log.info("reconcile %s: %s %s", r.venue, "OK" if r.ok else "FAILED", r.issues)
     pm = app.pm
+    if pm.sheets is not None:  # connection check at start-up (never blocks trading)
+        ok, msg = await pm.sheets.check_connection()
+        (log.info if ok else log.warning)("Google Sheets journal: %s", msg)
     await pm.start()
     watchdog = Watchdog(pm, settings.database_path.parent)
     pm.scheduler.add("watchdog", 60, watchdog.check, run_immediately=False)

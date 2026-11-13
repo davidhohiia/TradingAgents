@@ -296,20 +296,22 @@ class Repository:
         self.execute(
             "INSERT INTO positions (strategy_id, venue, symbol, mode, asset_class, correlation_group, quantity, "
             "avg_entry_price, realized_pnl, fees_paid, last_price, unrealized_pnl, stop_price, take_profit, "
-            "opened_at, updated_at, sub_strategy, leverage, liquidation_price, funding_paid) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "opened_at, updated_at, sub_strategy, leverage, liquidation_price, funding_paid, cycle_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(strategy_id, venue, symbol, mode) DO UPDATE SET quantity=excluded.quantity, "
             "avg_entry_price=excluded.avg_entry_price, realized_pnl=excluded.realized_pnl, "
             "fees_paid=excluded.fees_paid, last_price=excluded.last_price, unrealized_pnl=excluded.unrealized_pnl, "
             "stop_price=excluded.stop_price, take_profit=excluded.take_profit, opened_at=excluded.opened_at, "
             "updated_at=excluded.updated_at, correlation_group=excluded.correlation_group, "
             "sub_strategy=excluded.sub_strategy, leverage=excluded.leverage, "
-            "liquidation_price=excluded.liquidation_price, funding_paid=excluded.funding_paid",
+            "liquidation_price=excluded.liquidation_price, funding_paid=excluded.funding_paid, "
+            "cycle_json=excluded.cycle_json",
             (
                 p.strategy_id, p.venue, p.symbol, p.mode.value, p.asset_class.value, p.correlation_group,
                 p.quantity, p.avg_entry_price, p.realized_pnl, p.fees_paid, p.last_price, p.unrealized_pnl,
                 p.stop_price, p.take_profit, ts_to_str(p.opened_at), ts_to_str(p.updated_at),
                 p.sub_strategy, p.leverage, p.liquidation_price, p.funding_paid,
+                json.dumps(p.cycle) if p.cycle else None,
             ),
         )
 
@@ -507,6 +509,61 @@ class Repository:
             sql += " WHERE accepted=1"
         sql += " ORDER BY id DESC LIMIT ?"
         return self.query(sql, (limit,))
+
+    # ------------------------------------------------------------------ trade journal / Google Sheets outbox
+    def insert_journal_trade(self, t: dict[str, Any], ts: datetime) -> bool:
+        """Insert a closed trade AND its outbox entry (call inside the fill transaction).
+        Returns False if the trade id already exists (no duplicates)."""
+        cols = ["trade_id", "mode", "strategy_id", "venue", "symbol", "direction", "sub_strategy", "quantity",
+                "entry_price", "exit_price", "entry_time", "exit_time", "fees", "funding", "gross_pnl", "net_pnl",
+                "net_pct", "capital_employed", "leverage", "status", "close_reason", "entry_fills", "exit_fills"]
+        try:
+            with self.transaction():
+                self.execute(
+                    f"INSERT INTO journal_trades ({', '.join(cols)}, created_at) VALUES ({', '.join('?' * (len(cols) + 1))})",
+                    (*(t[c] for c in cols), ts_to_str(ts)))
+                self.execute(
+                    "INSERT INTO sheets_outbox (kind, record_key, payload_json, status, created_at) "
+                    "VALUES ('trade', ?, ?, 'pending', ?)", (t["trade_id"], json.dumps(t), ts_to_str(ts)))
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def list_journal_trades(self, mode: Mode | None = None) -> list[dict[str, Any]]:
+        if mode:
+            rows = self.query("SELECT * FROM journal_trades WHERE mode=? ORDER BY exit_time", (mode.value,))
+        else:
+            rows = self.query("SELECT * FROM journal_trades ORDER BY exit_time")
+        return [dict(r) for r in rows]
+
+    def pending_outbox(self, kind: str = "trade", limit: int = 500) -> list[sqlite3.Row]:
+        return self.query("SELECT * FROM sheets_outbox WHERE status='pending' AND kind=? ORDER BY id LIMIT ?",
+                          (kind, limit))
+
+    def mark_outbox_sent(self, ids: list[int], ts: datetime) -> None:
+        with self.transaction():
+            for i in ids:
+                self.execute("UPDATE sheets_outbox SET status='sent', sent_at=?, last_error=NULL WHERE id=?",
+                             (ts_to_str(ts), i))
+
+    def mark_outbox_failed(self, ids: list[int], error: str) -> None:
+        with self.transaction():
+            for i in ids:
+                self.execute("UPDATE sheets_outbox SET attempts=attempts+1, last_error=? WHERE id=?",
+                             (error[:500], i))
+
+    def outbox_stats(self) -> dict[str, int]:
+        rows = self.query("SELECT status, COUNT(*) n FROM sheets_outbox GROUP BY status")
+        out = {"pending": 0, "sent": 0}
+        out.update({r["status"]: int(r["n"]) for r in rows})
+        return out
+
+    def add_sync_error(self, ts: datetime, target: str, operation: str, error: str, retryable: bool) -> None:
+        self.execute("INSERT INTO sync_errors (ts, target, operation, error, retryable) VALUES (?,?,?,?,?)",
+                     (ts_to_str(ts), target, operation, error[:1000], int(retryable)))
+
+    def list_sync_errors(self, limit: int = 50) -> list[sqlite3.Row]:
+        return self.query("SELECT * FROM sync_errors ORDER BY id DESC LIMIT ?", (limit,))
 
     # ------------------------------------------------------------------ capital growth / monitoring
     def add_deposit(self, ts: datetime, amount_usd: float, kind: str, note: str = "",

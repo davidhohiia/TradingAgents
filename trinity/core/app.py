@@ -14,6 +14,7 @@ from trinity.bots.stock_trend.bot import StockTrendBot
 from trinity.config.settings import AppConfig, Settings, secret_value
 from trinity.core.capital_allocator import CapitalAllocator
 from trinity.core.capital_growth import CapitalGrowthManager
+from trinity.integrations.sheets.factory import build_sheets_syncer
 from trinity.core.live_guard import check_tests
 from trinity.monitoring.api_monitor import ApiMonitor
 from trinity.risk.leverage import LeverageGuard
@@ -216,6 +217,13 @@ def build_app(
 
     pm = PortfolioManager(config=config, repo=repo, engine=engine, mode=mode, bots=bots, clock=clock,
                           notifier=notifier, growth=growth, api_monitor=api_monitor)
+    sheets = build_sheets_syncer(settings, pm)
+    if sheets is not None:
+        pm.sheets = sheets
+        pm.sheets_interval = settings.google_sheets_sync_interval_seconds
+        closables.append(sheets.client)
+    elif settings.google_sheets_enabled:
+        notes.append("Google Sheets journal enabled but not configured: trades are kept locally (sheets_outbox)")
     return App(settings, config, mode, repo, clock, engine, pm, notifier, venues, closables, notes)
 
 

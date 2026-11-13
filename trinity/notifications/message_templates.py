@@ -13,7 +13,7 @@ HELP = (
     "TRINITY 3.0 commands:\n"
     "/status /balance /pnl /positions /trades\n"
     "/crypto (/grid) /stocks /arbitrage /risk /report\n"
-    "/capital /strategies\n"
+    "/capital /strategies /journal\n"
     "/pause /resume /stop /emergency_stop\n"
     "/paper /live_status"
 )

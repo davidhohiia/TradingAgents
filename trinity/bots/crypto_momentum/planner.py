@@ -13,7 +13,18 @@ from trinity.bots.crypto_momentum.strategies.momentum import MomentumStrategy
 from trinity.config.settings import CryptoMomentumConfig
 from trinity.core.indicators import floor_to_step
 from trinity.core.models import MarketInfo
+from trinity.ai.quality_score import QualityInputs, QualityScore, score_trade
+from trinity.config.settings import RegimeParams
+from trinity.core.market_regime import classify_regime
 from trinity.risk.correlation import return_correlations, select_uncorrelated
+
+
+def _num(v: object) -> float | None:
+    try:
+        f = float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return f if f == f else None
 
 
 @dataclass
@@ -85,6 +96,26 @@ class MomentumPlanner:
             if why:
                 return ExitDecision(True, why, True)  # risk-reducing exit
         return d
+
+    def quality(self, feat: pd.DataFrame, sig: EntrySignal, *, spread_bps: float | None, depth_usd: float | None,
+                order_usd: float, held: list[str], matrix: dict[tuple[str, str], float]) -> QualityScore:
+        """Trade Quality Score from the completed-bar features and the live order book (no estimates)."""
+        row, prev = feat.iloc[-1], feat.iloc[-2]
+        ind = self.cfg.indicators
+        mid_now, mid_prev = row.get("ema_mid"), feat["ema_mid"].iloc[-6] if len(feat) > 6 else None
+        regime = classify_regime(feat[["open", "high", "low", "close", "volume"]], RegimeParams(), ind.atr_period)
+        corr = [matrix[(sig.symbol, h)] for h in held if (sig.symbol, h) in matrix and h != sig.symbol]
+        return score_trade(QualityInputs(
+            adx=_num(row.get("adx")), ema_aligned=bool(row.close > row.ema_fast > row.ema_mid > row.ema_slow),
+            ema_slope_pct=(mid_now / mid_prev - 1) if _num(mid_now) and _num(mid_prev) else None,
+            rsi=_num(row.get("rsi")), macd_hist=_num(row.get("macd_hist")),
+            macd_rising=bool(row.macd_hist > prev.macd_hist) if _num(prev.get("macd_hist")) is not None else None,
+            volume_ratio=_num(row.get("vol_ratio")), atr_pct=_num(row.get("atr_pct")),
+            atr_band=(ind.min_atr_pct, ind.max_atr_pct), spread_bps=spread_bps,
+            depth_ratio=(depth_usd / order_usd) if depth_usd is not None and order_usd > 0 else None,
+            regime=regime.regime.value if regime.sufficient_data else None,
+            reward_risk=(sig.take_profit - sig.entry) / sig.risk_per_unit if sig.risk_per_unit > 0 else None,
+            max_correlation=max(corr) if corr else None, held_positions=len([h for h in held if h != sig.symbol])))
 
     @staticmethod
     def size(sig: EntrySignal, *, max_risk_usd: float, available: float, max_notional: float,

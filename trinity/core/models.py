@@ -194,6 +194,7 @@ class OrderIntent:
     client_order_id: str = ""
     sub_strategy: str = ""  # e.g. "momentum" / "breakout" (separate statistics)
     leverage: float = 1.0  # 1.0 = spot. >1 only via the LeverageGuard (disabled by default)
+    quality_score: float | None = None  # Trade Quality Score 0..100 (required for entries)
     tags: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -272,6 +273,7 @@ class OrderRecord:
     updated_at: datetime = field(default_factory=utcnow)
     sub_strategy: str = ""
     leverage: float = 1.0
+    quality_score: float | None = None
 
     @property
     def remaining(self) -> float:

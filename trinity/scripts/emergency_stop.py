@@ -6,9 +6,10 @@ read before EVERY order) and while it is stopped.
     python trinity/scripts/emergency_stop.py --clear           # requires typed confirmation
     python trinity/scripts/emergency_stop.py --confirm-drawdown  # after reviewing a max-drawdown lock
 
-Activating blocks all NEW orders immediately. Open orders are canceled by the running engine
-on its next cycle only if you also send /emergency_stop via Telegram, otherwise cancel them
-on the exchange UI. Positions are never liquidated automatically.
+Activating blocks every NEW position immediately (the flag is read before every order). If the
+engine is running, its Position Guardian cancels unfilled entry orders within ~15 s and keeps
+enforcing protective stops; exits stay allowed. Positions are never liquidated automatically.
+Telegram /emergency_stop runs the full protocol at once (SPEC_4.0 A3).
 """
 
 from __future__ import annotations

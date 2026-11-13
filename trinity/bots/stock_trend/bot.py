@@ -14,7 +14,12 @@ from typing import Any
 
 from trinity.ai.anomaly_detector import AnomalyDetector
 from trinity.bots.base import BaseBot
+from trinity.ai.quality_score import QualityInputs, QualityScore, score_trade
 from trinity.bots.stock_trend.breakout import evaluate_breakout_entry
+from trinity.config.settings import RegimeParams
+from trinity.core.indicators import adx, last_valid, macd
+from trinity.core.market_regime import classify_regime
+from trinity.risk.correlation import return_correlations
 from trinity.bots.stock_trend.signals import compute_signals
 from trinity.bots.stock_trend.strategy import PositionState, StockTrendStrategy
 from trinity.config.settings import AppConfig, StockTrendConfig
@@ -41,6 +46,8 @@ class StockTrendBot(BaseBot):
             s: PositionState(**v) for s, v in raw.get("positions", {}).items()
         }
         self.last_exit_day: dict[str, str] = raw.get("last_exit_day", {})
+        self._closes: dict[str, Any] = {}
+        self._last_signal: dict[str, tuple[str, str, int]] = {}
         if self.gateway is not None:
             self.gateway.on_fill(self._on_fill)
 
@@ -155,16 +162,65 @@ class StockTrendBot(BaseBot):
             info["entry"] = {"trend": trend.reasons, "breakout": brk.reasons}
             if not dec.enter or dec.sizing is None:
                 continue
-            res = await self.gateway.submit(OrderIntent(
+            threshold = self.app.quality.threshold(self.strategy_id)
+            q = self._quality(df, sig, dec, bid, ask, book, symbol)
+            info["quality"] = {"score": q.score, "grade": q.grade, "threshold": threshold}
+            if not q.passes(threshold):
+                info["entry"] = f"quality {q.score} < {threshold}"
+                self._record(now, symbol, sub, q, threshold, "rejected_quality", f"score {q.score} < {threshold}")
+                continue
+            intent = OrderIntent(
                 strategy_id=self.strategy_id, venue=self.gateway.venue, symbol=symbol, side=Side.BUY,
                 order_type=OrderType.LIMIT, quantity=dec.sizing.quantity, reference_price=ask,
                 market_data_ts=book.ts, asset_class=AssetClass.STOCK, price=dec.entry_price,
                 stop_price=dec.stop, take_profit=dec.take_profit, reason=f"{sub}: " + "; ".join(dec.reasons),
-                sub_strategy=sub))
+                sub_strategy=sub, quality_score=q.score)
+            res = await self.gateway.submit(intent)
+            self._record(now, symbol, sub, q, threshold, "submitted" if res.accepted else "rejected_risk",
+                         "; ".join(res.reasons), intent.client_order_id)
             info["submitted"] = {"accepted": res.accepted, "why": res.reasons, "strategy": sub}
             if res.accepted:
                 open_syms.append(symbol)
         self._persist()
+
+
+    def _quality(self, df: Any, sig: Any, dec: Any, bid: float, ask: float, book: Any, symbol: str) -> QualityScore:
+        """Trade Quality Score from completed daily bars and the live quote (no estimates)."""
+        c = self.cfg
+        mac = macd(df["close"])
+        hist = mac["macd_hist"].dropna()
+        vol_avg = df["volume"].iloc[-c.volume_lookback - 1:-1].mean()
+        self._closes[symbol] = df["close"]
+        held = [s for s in self.cfg.symbols if s != symbol and self.gateway.position(s).is_open]
+        matrix = return_correlations({k: v for k, v in self._closes.items() if k in held + [symbol]}, 120)
+        corr = [matrix[(symbol, h)] for h in held if (symbol, h) in matrix]
+        regime = classify_regime(df, RegimeParams(), c.atr_period)
+        notional = dec.sizing.quantity * dec.entry_price
+        top = (book.asks[0][0] * book.asks[0][1]) if book.asks else None
+        risk = dec.entry_price - dec.stop
+        return score_trade(QualityInputs(
+            adx=last_valid(adx(df, c.atr_period)), ema_aligned=bool(sig.ema_fast > sig.ema_slow),
+            ema_slope_pct=sig.ema_slow_slope, rsi=sig.rsi,
+            macd_hist=float(hist.iloc[-1]) if len(hist) else None,
+            macd_rising=bool(hist.iloc[-1] > hist.iloc[-2]) if len(hist) > 1 else None,
+            volume_ratio=float(df["volume"].iloc[-1] / vol_avg) if vol_avg and vol_avg == vol_avg else None,
+            atr_pct=(sig.atr / sig.close) if sig.atr and sig.close else None, atr_band=(0.003, 0.04),
+            spread_bps=(ask - bid) / ((ask + bid) / 2) * 10_000 if bid > 0 and ask > 0 else None,
+            depth_ratio=(top / notional) if top and notional > 0 else None,
+            regime=regime.regime.value if regime.sufficient_data else None,
+            reward_risk=(dec.take_profit - dec.entry_price) / risk if risk > 0 else None,
+            max_correlation=max(corr) if corr else None, held_positions=len(held)))
+
+    def _record(self, now: datetime, symbol: str, sub: str, q: QualityScore, threshold: int, decision: str,
+                why: str = "", cid: str | None = None) -> None:
+        key = (now.date().isoformat(), decision, q.score)
+        if self._last_signal.get(symbol) == key:
+            return  # same evaluation repeated within the day: stored once
+        self._last_signal[symbol] = key
+        self.repo.add_signal(ts=now, mode=self.mode, strategy_id=self.strategy_id, sub_strategy=sub, symbol=symbol,
+                             score=q.score, grade=q.grade, threshold=threshold, decision=decision,
+                             reasons=(why + " | " if why else "") + "; ".join(q.reasons), components=q.components,
+                             client_order_id=cid)
 
 
 def _iso(ts: datetime) -> str:

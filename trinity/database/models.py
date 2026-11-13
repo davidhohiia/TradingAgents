@@ -38,6 +38,7 @@ REQUIRED_TABLES = (
     "journal_trades",
     "sheets_outbox",
     "sync_errors",
+    "signals",
 )
 
 
@@ -80,6 +81,7 @@ def row_to_order(row: sqlite3.Row) -> OrderRecord:
         updated_at=str_to_ts(row["updated_at"]),  # type: ignore[arg-type]
         sub_strategy=row["sub_strategy"] or "",
         leverage=float(row["leverage"] or 1.0),
+        quality_score=row["quality_score"],
     )
 
 

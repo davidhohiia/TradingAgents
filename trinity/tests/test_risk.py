@@ -26,7 +26,7 @@ from trinity.risk.risk_manager import DRAWDOWN_CONFIRM_PHRASE, RiskContext
 
 
 def intent(system, **kw) -> OrderIntent:
-    base = dict(strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
+    base = dict(strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY, quality_score=80,
                 order_type=OrderType.LIMIT, quantity=0.0003, reference_price=60000.0, price=59900.0,
                 stop_price=57000.0, market_data_ts=system.clock.now(), asset_class=AssetClass.CRYPTO)
     base.update(kw)
@@ -329,13 +329,19 @@ def test_drawdown_peak_survives_restart(system, tmp_path, config):
     assert st.peak_equity == 530 and st.drawdown_pct == pytest.approx(30 / 530)
 
 
-def test_emergency_stop_blocks_everything_including_exits(system):
+def test_emergency_stop_blocks_new_positions_but_allows_exits(system):
+    """SPEC_4.0 A3: emergency blocks every new position; reducing exits stay possible (positions controlled)."""
     rm = system.risk
     rm.emergency_stop("test")
+    assert not rm.check_order(intent(system), ctx(system)).approved
     snap = ExposureSnapshot()
     snap.position_qty[("crypto_momentum", "BTC/USDT")] = 0.001
-    sell = intent(system, side=Side.SELL, quantity=0.0005, price=60000, stop_price=None, protective_exit=True)
-    assert not rm.check_order(sell, ctx(system, snap)).approved
+    stop_exit = intent(system, side=Side.SELL, quantity=0.0005, price=60000, stop_price=None, protective_exit=True)
+    tp_exit = intent(system, side=Side.SELL, quantity=0.0005, price=60000, stop_price=None)
+    assert rm.check_order(stop_exit, ctx(system, snap)).approved
+    assert rm.check_order(tp_exit, ctx(system, snap)).approved
+    too_big = intent(system, side=Side.SELL, quantity=0.002, price=60000, stop_price=None, protective_exit=True)
+    assert not rm.check_order(too_big, ctx(system, snap)).approved  # still no shorting
     assert not rm.resume()[0]
     assert not rm.clear_emergency_stop("please")
     assert rm.clear_emergency_stop("CLEAR EMERGENCY STOP")

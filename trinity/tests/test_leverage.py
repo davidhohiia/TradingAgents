@@ -89,7 +89,7 @@ def _permitted_guard(tmp_path, config):
 
 
 def lev_intent(**kw):
-    base = dict(strategy_id="crypto_momentum", venue="crypto_perp", symbol="BTC/USDT", side=Side.BUY,
+    base = dict(strategy_id="crypto_momentum", venue="crypto_perp", symbol="BTC/USDT", side=Side.BUY, quality_score=80,
                 order_type=OrderType.LIMIT, quantity=0.001, reference_price=60000, price=60000, stop_price=58000,
                 market_data_ts=START, asset_class=AssetClass.CRYPTO, leverage=1.5)
     base.update(kw)

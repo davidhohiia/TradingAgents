@@ -102,7 +102,7 @@ async def _book(system):
 async def test_engine_partial_fills_produce_exactly_one_journal_trade(system):
     b = await _book(system)
     price = round(b.best_bid * 0.99, 2)
-    res = await system.engine.submit(OrderIntent(
+    res = await system.engine.submit(OrderIntent(quality_score=80, 
         strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY, order_type=OrderType.LIMIT,
         quantity=0.0004, reference_price=b.best_ask, price=price, stop_price=price * 0.98, market_data_ts=b.ts,
         asset_class=AssetClass.CRYPTO, sub_strategy="momentum"))
@@ -140,7 +140,7 @@ async def test_engine_partial_fills_produce_exactly_one_journal_trade(system):
 
 async def test_fee_in_base_dust_closes_cycle(system):
     b = await _book(system)
-    res = await system.engine.submit(OrderIntent(
+    res = await system.engine.submit(OrderIntent(quality_score=80, 
         strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY, order_type=OrderType.LIMIT,
         quantity=0.0003, reference_price=b.best_ask, price=round(b.best_bid * 0.99, 2),
         stop_price=b.best_bid * 0.95, market_data_ts=b.ts, asset_class=AssetClass.CRYPTO))

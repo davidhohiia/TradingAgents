@@ -273,6 +273,7 @@ class ExecutionEngine:
             take_profit=intent.take_profit, reduce_only=intent.side == Side.SELL, reserved_usd=reserve,
             reason=intent.reason, parent_client_order_id=intent.parent_client_order_id,
             created_at=now, updated_at=now, sub_strategy=intent.sub_strategy, leverage=intent.leverage,
+            quality_score=intent.quality_score,
         )
         if intent.leverage > 1.0:
             # isolated margin + leverage must be set on the venue BEFORE the order (never increased later)

@@ -11,7 +11,8 @@ Drawdown tiers (from the deposit-adjusted equity peak):
   open orders canceled, manual confirmation) -> 20% HARD STOP (only protective exits).
 
 Locks (persisted in the DB, survive restarts):
-  emergency_stop  manual; blocks ALL orders; cleared only locally
+  emergency_stop  manual; blocks every NEW position; only reducing exits allowed so open
+                  positions stay under control (SPEC_4.0 A3); cleared only locally
   hard_stop       20% drawdown; protective exits only; cleared only locally
   drawdown_lock   15% drawdown; protective exits only; manual confirmation
   recovery_lock   DB restored / reconciliation failed; protective exits only
@@ -38,6 +39,7 @@ from trinity.risk.correlation import correlated_with
 from trinity.risk.drawdown_monitor import DrawdownMonitor, DrawdownStatus, iso_week
 from trinity.risk.exposure_manager import ExposureSnapshot
 from trinity.risk.leverage import LeverageGuard
+from trinity.risk.profiles import get_profile, profile_violations
 
 log = get_logger(__name__)
 
@@ -104,6 +106,11 @@ class RiskManager:
         self.last_status: DrawdownStatus | None = None
         self.correlations: dict[tuple[str, str], float] = {}
         self.tests_ok: bool | None = None
+        self.profile = get_profile(config.profile)
+        self._integrity_alerted = False
+        bad = profile_violations(self.profile, config.risk, config.quality)
+        if bad:
+            raise ValueError("risk configuration does not match profile: " + "; ".join(bad))
 
     # ------------------------------------------------------------------ state
     @property
@@ -319,7 +326,16 @@ class RiskManager:
         protective = is_reducing and intent.protective_exit
 
         # 1. locks
-        check("emergency_stop", not s.emergency_stop, "emergency stop active: all orders blocked")
+        # 0. BALANCED profile integrity (limits may never be changed at runtime, by AI or anything else)
+        violations = profile_violations(self.profile, self.config.risk, self.config.quality)
+        if violations or self.config.risk is not self.rc:
+            msg = "risk profile integrity violation: " + ("; ".join(violations) or "risk config object replaced")
+            if not self._integrity_alerted:
+                self._integrity_alerted = True
+                self._event("CRITICAL", "PROFILE_INTEGRITY", msg)
+            check("profile_integrity", is_reducing and intent.protective_exit, msg)
+        check("emergency_stop", not s.emergency_stop or is_reducing,
+              "emergency stop active: new positions blocked (only reducing exits allowed)")
         if self.mode == Mode.LIVE:
             check("live_enabled", not s.live_disabled or protective, "live trading disabled by risk system")
         check("hard_stop", not s.hard_stop or protective, "20% hard stop: only protective exits allowed")
@@ -378,6 +394,12 @@ class RiskManager:
             return self._finish(intent, reasons, checks)
 
         # 6. risk-increasing order
+        threshold = self.config.quality.threshold(intent.strategy_id)
+        if intent.quality_score is None:
+            check("quality_score", False, "entry without Trade Quality Score is not allowed")
+        else:
+            check("quality_score", intent.quality_score >= threshold,
+                  f"Trade Quality Score {intent.quality_score:.0f} < threshold {threshold} ({self.profile.name})")
         equity = ctx.equity if ctx.equity > 0 else self.initial_capital
         mult = self.activity_multiplier()
         notional = intent.notional

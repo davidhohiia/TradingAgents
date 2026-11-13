@@ -1,11 +1,11 @@
-# TRINITY 3.0 — AI Trading System (Aggressive Growth Edition)
+# TRINITY 4.0 (в разработке) — Autonomous Multi-Strategy Trading System
 
 > ⚠️ **Важно.** TRINITY — инструмент для исследования и автоматизации торговли с контролем риска.
 > Он **не гарантирует прибыль**. Торговля криптовалютами и акциями может привести к потере части
 > или всего капитала. По умолчанию система работает **только в режиме виртуальной торговли (PAPER)**.
 > Все результаты виртуальной торговли, бэктестов и симуляций — виртуальные и не предсказывают реальные.
 
-Быстрый старт: [QUICKSTART.md](QUICKSTART.md) · Риски: [RISK_POLICY.md](RISK_POLICY.md) ·
+Быстрый старт: [QUICKSTART.md](QUICKSTART.md) · ТЗ 4.0: [SPEC_4.0.md](SPEC_4.0.md) · Риски: [RISK_MANAGEMENT.md](RISK_MANAGEMENT.md) · Изменения: [CHANGELOG.md](CHANGELOG.md) ·
 Ключи API: [API_SETUP.md](API_SETUP.md) · Google Sheets: [GOOGLE_SHEETS_SETUP.md](GOOGLE_SHEETS_SETUP.md) · Windows 24/7: [DEPLOYMENT_WINDOWS.md](DEPLOYMENT_WINDOWS.md)
 
 ---
@@ -79,7 +79,7 @@ trinity/
                           run_backtest.py, simulate_24h.py, windows/*.ps1|*.bat
   integrations/sheets/    Google Sheets журнал: journal (P&L, объединение исполнений), client (Sheets API v4),
                           sync (очередь, дедупликация, повторы), stats (листы статистики)
-  tests/                  pytest (191 тест)
+  tests/                  pytest (215 тестов)
 ```
 
 ## 3. Установка
@@ -168,6 +168,12 @@ python trinity/scripts/capital.py --approve 3                    # только 
 Команды: `/start /status /balance /pnl /positions /trades /crypto (/grid) /stocks /arbitrage /risk
 /report /capital /strategies /journal /pause /resume /stop /emergency_stop /paper /live_status`.
 
+* `/pause` и `/emergency_stop` — мгновенно, без подтверждения. `/resume` и `/stop` — двухшагово:
+  бот отвечает одноразовым кодом, действие выполняется командой `/confirm <код>` (120 с, только тем же
+  пользователем, `/cancel` — отмена). `/resume` перед выдачей кода и повторно при подтверждении проверяет
+  связь с площадками, защищённость позиций, Risk Engine, отсутствие критических ошибок и сверку балансов.
+* Пауза и `/stop` не оставляют позиции без контроля: боты продолжают их сопровождать, Position Guardian
+  каждые 15 с исполняет стопы. Аварийный протокол — в [RISK_MANAGEMENT.md](RISK_MANAGEMENT.md).
 * Посторонние пользователи получают «Access denied», попытка пишется в журнал.
 * `/emergency_stop` сначала блокирует все новые ордера, затем отменяет открытые. Позиции не ликвидируются.
 * `/resume` снимает **только** паузу. Блокировки по просадке, аварийной остановке и требование
@@ -240,7 +246,7 @@ streamlit run trinity/dashboard/app.py      # или start_dashboard.bat → htt
 6. биржа/брокер: загрузка рынков, наличие инструментов, работа ключа, кэш-счёт без маржи;
 7. критерии paper-валидации (раздел 7);
 8. нет аварийной остановки / блокировки по просадке;
-9. интерактивное подтверждение в консоли: ввод `START LIVE TRADING`.
+9. двухшаговое подтверждение в консоли: фраза `START LIVE TRADING`, затем сводка и одноразовый код.
 
 После старта выполняется сверка балансов, ордеров и позиций; при ошибке LIVE блокируется.
 `main.py`, автозапуск и Docker **всегда** стартуют в PAPER — после перезагрузки LIVE не возобновляется.

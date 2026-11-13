@@ -11,11 +11,13 @@ everything through the ExecutionEngine and the Global Risk Manager.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
 from trinity.ai.performance_analyzer import StrategyAnalytics
 from trinity.core.capital_growth import CapitalGrowthManager
+from trinity.core.position_guardian import PositionGuardian
 from trinity.monitoring.api_monitor import ApiMonitor
 from trinity.risk.leverage import funding_cost
 from trinity.risk.risk_manager import RiskAction
@@ -35,6 +37,21 @@ from trinity.notifications.notifier import LogNotifier, Notifier
 log = get_logger(__name__)
 
 MAX_BOT_RESTARTS = 10
+
+
+@dataclass
+class ResumeReport:
+    checks: list[tuple[str, bool, str]] = field(default_factory=list)
+
+    def add(self, name: str, ok: bool, detail: str) -> None:
+        self.checks.append((name, ok, detail))
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.checks) and all(c[1] for c in self.checks)
+
+    def text(self) -> str:
+        return "\n".join(f"{'✅' if ok else '❌'} {n}: {d}" for n, ok, d in self.checks)
 EQUITY_SNAPSHOT_EVERY = timedelta(minutes=5)
 
 
@@ -72,6 +89,8 @@ class PortfolioManager:
         engine.allocator._all_fn = self.growth.allocations  # noqa: SLF001
         self.api_monitor = api_monitor
         self.sheets: Any = None  # optional Google Sheets journal syncer (set by the app builder)
+        self.guardian = PositionGuardian(engine, config, self.notifier, self.clock)
+        self._paused_at: datetime | None = None
         self.sheets_interval = 60.0
         self.restarts: dict[str, int] = dict.fromkeys(self.bots, 0)
         self._last_equity_snapshot: datetime | None = None
@@ -92,6 +111,8 @@ class PortfolioManager:
             await bot.start()
             self.scheduler.add(f"bot:{bot.strategy_id}", bot.loop_interval, self._bot_runner(bot))
         self.scheduler.add("sync_orders", 15, self.engine.sync_orders, timeout=120)
+        self.scheduler.add("position_guardian", self.config.emergency.guardian_interval_seconds,
+                           self.guardian.run_once, timeout=60)
         self.scheduler.add("risk_monitor", 30, self.monitor, timeout=60)
         self.scheduler.add("daily_report", 300, self.maybe_daily_report, timeout=60)
         self.scheduler.add("analytics", 3600, self.analytics, timeout=120, run_immediately=False)
@@ -423,27 +444,110 @@ class PortfolioManager:
         return d
 
     def pause(self, reason: str = "operator") -> None:
+        """/pause: instant. Blocks NEW positions; open positions stay managed by bots and the guardian."""
         self.risk.pause(reason)
+        self._paused_at = self.clock.now()
+        for bot in self.bots.values():
+            bot.paused = True
+
+    async def resume_checks(self) -> ResumeReport:
+        """The five checks required before /resume (SPEC_4.0 A2). Read-only except reconciliation."""
+        rep = ResumeReport()
+        # 1. venue connectivity
+        for name, venue in self.engine.venues.items():
+            sym = next((p.symbol for p in self.positions.all(open_only=True) if p.venue == name), None) or next(
+                (s for s in self.config.instruments if self._venue_supports(venue, s)), None)
+            try:
+                if sym:
+                    await venue.fetch_ticker(sym)
+                rep.add(f"connection:{name}", self.engine.breakers.allow(name), "reachable"
+                        if self.engine.breakers.allow(name) else "circuit breaker open")
+            except ExchangeError as exc:
+                rep.add(f"connection:{name}", False, f"unreachable: {str(exc)[:120]}")
+        # 2. open positions are protected and priced
+        unprotected = [f"{p.strategy_id}:{p.symbol}" for p in self.positions.all(open_only=True) if not p.stop_price]
+        rep.add("positions", not unprotected, "all open positions have a stop" if not unprotected
+                else "no stop on: " + ", ".join(unprotected))
+        # 3. risk engine: only the pause may be cleared by /resume
+        locks = [lk for lk in self.risk.blocking_locks() if lk != "paused"]
+        rep.add("risk_engine", not locks, "no locks besides pause" if not locks
+                else "locks that /resume cannot clear: " + ", ".join(locks))
+        # 4. no critical execution errors since the pause, no open circuit breakers
+        since = (self._paused_at or self.clock.now()).isoformat()
+        crit = self.repo.query("SELECT event_type, message FROM risk_events WHERE ts>=? AND event_type IN "
+                               "('OVERFILL','LIMIT_VIOLATION','UNEXPECTED_FILL','RECONCILIATION_FAILED',"
+                               "'LIQUIDATION_RISK','PROFILE_INTEGRITY','CONNECTION_LOST')", (since,))
+        restored = self.repo.query("SELECT COUNT(*) FROM risk_events WHERE ts>=? AND event_type='CONNECTION_RESTORED'",
+                                   (since,))[0][0]
+        crit = [r for r in crit if not (r["event_type"] == "CONNECTION_LOST" and restored)]
+        open_breakers = [n for n, b in self.engine.breakers.snapshot().items() if b["state"] != "closed"]
+        rep.add("critical_errors", not crit and not open_breakers,
+                "none" if not crit and not open_breakers else
+                "; ".join([f"{r['event_type']}: {r['message'][:80]}" for r in crit] + [f"breaker {b}" for b in open_breakers]))
+        # 5. actual balances/orders/positions synchronised with the venue
+        problems = []
+        for name in self.engine.venues:
+            r = await self.engine.reconcile(name)
+            if not r.ok:
+                problems.append(f"{name}: {', '.join(r.issues)[:150]}")
+        rep.add("balance_sync", not problems, "venues reconciled" if not problems else "; ".join(problems))
+        return rep
+
+    @staticmethod
+    def _venue_supports(venue: Any, symbol: str) -> bool:
+        try:
+            venue.market_info(symbol)
+            return True
+        except ExchangeError:
+            return False
+
+    async def resume_confirmed(self) -> ResumeReport:
+        """Second step of /resume: re-run every check, then clear ONLY the pause flag."""
+        rep = await self.resume_checks()
+        if rep.ok:
+            ok, remaining = self.risk.resume()
+            if ok:
+                for bot in self.bots.values():
+                    bot.paused = False
+            else:
+                rep.add("risk_engine_after", False, "still blocked: " + ", ".join(remaining))
+        return rep
 
     def resume(self) -> tuple[bool, list[str]]:
+        """Low-level pause removal (local tools/tests). Telegram must use resume_checks + resume_confirmed."""
         return self.risk.resume()
 
     async def stop_trading(self) -> int:
-        """/stop: stop bots and cancel unfilled entry (buy) orders. Positions are kept."""
-        for bot in self.bots.values():
-            bot.paused = True
-        self.risk.pause("stop command")
+        """/stop (confirmed): no new entries, unfilled entry orders canceled, positions stay managed."""
+        self.pause("stop command")
         return await self.engine.cancel_where(side=Side.BUY, reason="stop command")
 
-    async def emergency_stop(self, reason: str = "operator") -> int:
-        """Immediately block ALL new orders, then cancel open orders. Never liquidates positions."""
-        self.risk.emergency_stop(reason)  # first: blocks order placement synchronously
-        for bot in self.bots.values():
+    async def emergency_stop(self, reason: str = "operator") -> dict[str, Any]:
+        """Emergency protocol HOLD_PROTECTED (SPEC_4.0 A3). Instant; never leaves positions unmanaged."""
+        self.risk.emergency_stop(reason)  # 1. synchronous: every new position is rejected from now on
+        for bot in self.bots.values():  # 2. bots: no entries, exit management continues
             bot.paused = True
-        n = await self.engine.cancel_where(reason="emergency stop")
-        await self.notifier.notify("emergency_stop", f"🚨 EMERGENCY STOP ({reason}). New orders blocked, "
-                                   f"{n} open orders canceled. Positions kept.", "CRITICAL")
-        return n
+        active_buys = [o for o in self.repo.list_active_orders(self.mode) if o.side == Side.BUY]
+        canceled = await self.engine.cancel_where(side=Side.BUY, reason="emergency stop")  # 3. safe cancels
+        not_canceled = len([o for o in self.repo.list_active_orders(self.mode) if o.side == Side.BUY])
+        guard = await self.guardian.run_once()  # 4+5. stops for every position, protective exits if breached
+        positions = self.positions_data()
+        lines = [f"• {p['strategy_id']} {p['symbol']} {p['quantity']:g} @ {p['avg']:.2f}, stop "
+                 f"{p['stop']:.2f}" if p["stop"] else f"• {p['strategy_id']} {p['symbol']} {p['quantity']:g}: "
+                 "NO STOP (price unavailable, guardian retrying)" for p in positions] or ["• no open positions"]
+        report = {"canceled_entries": canceled, "entries_left": not_canceled, "entries_found": len(active_buys),
+                  "positions": positions, "stops_assigned": guard.stops_assigned,
+                  "protective_exits": guard.exits_submitted, "unguarded": guard.unguarded}
+        self.repo.add_risk_event(self.mode, "CRITICAL", "EMERGENCY_PROTOCOL", f"HOLD_PROTECTED ({reason})",
+                                 details=report, ts=self.clock.now())
+        await self.notifier.notify(
+            "emergency_stop",
+            f"🚨 EMERGENCY STOP ({reason}). New positions blocked. Canceled {canceled} unfilled entry orders"
+            + (f", {not_canceled} not canceled yet (retrying)" if not_canceled else "")
+            + ". Positions are NOT liquidated; protective stops are enforced by the Position Guardian:\n"
+            + "\n".join(lines) + ("\nUnguarded: " + "; ".join(guard.unguarded) if guard.unguarded else "")
+            + "\nClear locally: scripts/emergency_stop.py --clear", "CRITICAL")
+        return report
 
     def paper_validation(self) -> dict[str, Any]:
         """Progress towards the MINIMUM paper criteria (not a guarantee of future returns)."""

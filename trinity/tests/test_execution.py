@@ -36,7 +36,7 @@ async def book(system, symbol="BTC/USDT"):
 async def buy_intent(system, qty=0.0003, order_type=OrderType.MARKET, price=None, stop_frac=0.97, **kw):
     b = await book(system)
     ref = b.best_ask
-    return OrderIntent(strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
+    return OrderIntent(quality_score=80, strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
                        order_type=order_type, quantity=qty, reference_price=ref, market_data_ts=b.ts,
                        asset_class=AssetClass.CRYPTO, price=price,
                        stop_price=(price or ref) * stop_frac, **kw)
@@ -189,7 +189,7 @@ async def test_self_trade_between_strategies_rejected(system):
     b = await book(system)
     sell = await sell_intent(system, 0.0003, order_type=OrderType.LIMIT, price=round(b.best_ask * 1.01, 2))
     assert (await system.engine.submit(sell)).accepted
-    other = OrderIntent(strategy_id="other", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
+    other = OrderIntent(quality_score=80, strategy_id="other", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
                         order_type=OrderType.LIMIT, quantity=0.0002, reference_price=b.best_ask,
                         price=round(b.best_ask * 1.012, 2), stop_price=b.best_ask * 0.97, market_data_ts=b.ts,
                         asset_class=AssetClass.CRYPTO)
@@ -355,7 +355,7 @@ async def make_live_engine(tmp_path: Path, config, fake: FakeCCXT):
 async def test_integration_simulated_exchange_partial_fills_live_path(tmp_path, config):
     fake = FakeCCXT()
     engine, clock = await make_live_engine(tmp_path, config, fake)
-    i = OrderIntent(strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
+    i = OrderIntent(quality_score=80, strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
                     order_type=OrderType.LIMIT, quantity=0.0004, reference_price=60010.0, price=59500.0,
                     stop_price=57000.0, market_data_ts=clock.now(), asset_class=AssetClass.CRYPTO)
     res = await engine.submit(i)

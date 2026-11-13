@@ -5,6 +5,20 @@
 # The 30% monthly figure is an informational ASPIRATION only. It is never used to open
 # trades, size positions or relax limits. No return is guaranteed.
 
+# The ONLY approved risk profile (SPEC_4.0.md A4). The values in "risk" and "quality" must match it
+# exactly, otherwise the configuration does not load. Per-bot quality thresholds may only be raised.
+profile: BALANCED
+
+quality:
+  min_score: 70                     # Trade Quality Score 0..100; entries below the threshold are rejected
+  per_bot:
+    crypto_momentum: 70
+    stock_trend: 70
+
+emergency:
+  default_stop_pct: 0.03            # emergency stop for positions that have none: last price - 3%
+  guardian_interval_seconds: 15     # Position Guardian check interval (always active)
+
 capital:
   total_capital_usd: 500            # initial contributed capital (recorded as the first deposit)
   allocations:                      # INITIAL allocation. Later changes only via approved reallocation.

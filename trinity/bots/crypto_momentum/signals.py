@@ -8,7 +8,7 @@ from __future__ import annotations
 import pandas as pd
 
 from trinity.config.settings import MomentumIndicators
-from trinity.core.indicators import atr, ema, macd, rsi, sma
+from trinity.core.indicators import adx, atr, ema, macd, rsi, sma
 
 
 def compute_features(df: pd.DataFrame, p: MomentumIndicators) -> pd.DataFrame:
@@ -23,6 +23,7 @@ def compute_features(df: pd.DataFrame, p: MomentumIndicators) -> pd.DataFrame:
     out["atr"] = atr(out, p.atr_period)
     out["atr_pct"] = out["atr"] / c
     out["vol_ratio"] = out["volume"] / sma(out["volume"], p.volume_lookback)
+    out["adx"] = adx(out, p.atr_period)
     return out
 
 

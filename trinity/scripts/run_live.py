@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import secrets
 import asyncio
 import sys
 from pathlib import Path
@@ -73,6 +74,23 @@ async def verify_venues(settings: Settings, config: AppConfig) -> LiveGateReport
     return rep
 
 
+def live_summary(settings: Settings, config: AppConfig) -> str:
+    r = config.risk
+    lines = [
+        "------------------------------ LIVE SUMMARY ------------------------------",
+        f" risk profile: {config.profile} | quality score >= {config.quality.min_score}",
+        f" risk/trade {r.max_risk_per_trade_pct:.2%} | open risk {r.max_total_open_risk_pct:.0%} | daily "
+        f"{r.max_daily_loss_pct:.0%} | weekly {r.max_weekly_loss_pct:.0%} | DD {r.drawdown_warning_pct:.0%}/"
+        f"{r.drawdown_reduce_pct:.0%}/{r.drawdown_live_lock_pct:.0%}/{r.drawdown_emergency_pct:.0%}",
+        f" crypto venue: {settings.crypto_exchange_id} | stock broker: {settings.stock_broker}"
+        f" | leverage: {'gated' if config.leverage.enabled else 'OFF'}",
+        f" allocations: {config.capital.allocations} | reserve {config.capital.reserve_usd}",
+        " After any restart the system starts in PAPER again; LIVE always needs this procedure.",
+        "---------------------------------------------------------------------------",
+    ]
+    return "\n".join(lines)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true")
@@ -102,9 +120,17 @@ def main() -> int:
         print("Live start requires an interactive console (no automatic live start).")
         return 1
     print(WARNING)
-    typed = input(f'Type "{INTERACTIVE_PHRASE}" to start live trading: ').strip()
+    # step 1 of 2: explicit phrase
+    typed = input(f'Step 1/2 - type "{INTERACTIVE_PHRASE}" to continue: ').strip()
     if typed != INTERACTIVE_PHRASE:
         print("Confirmation not given. Aborting.")
+        return 1
+    # step 2 of 2: review the summary and repeat a one-time code
+    code = f"{secrets.randbelow(10**6):06d}"
+    print(live_summary(settings, config))
+    typed_code = input(f"Step 2/2 - type the one-time code {code} to start LIVE trading: ").strip()
+    if typed_code != code:
+        print("Code mismatch. Aborting - the system stays in PAPER mode.")
         return 1
     repo, _ = open_database(settings.database_path, settings.backup_dir)
     raw = repo.get_kv("risk:live:state") or {}

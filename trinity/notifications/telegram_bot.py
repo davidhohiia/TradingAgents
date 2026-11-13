@@ -21,6 +21,8 @@ import httpx
 from trinity.core.log import get_logger, redact
 from trinity.core.portfolio_manager import PortfolioManager
 from trinity.notifications import message_templates as tpl
+from trinity.core.clock import RealClock
+from trinity.notifications.confirmations import ConfirmationManager
 from trinity.notifications.notifier import Notifier
 
 log = get_logger(__name__)
@@ -40,6 +42,7 @@ class TelegramControlCenter(Notifier):
         self._offset: int | None = None
         self._stop = asyncio.Event()
         self.unauthorized_attempts = 0
+        self.confirmations = ConfirmationManager(pm.clock if pm is not None else RealClock())
 
     def _url(self, method: str) -> str:
         return f"{API}/bot{self._token}/{method}"
@@ -78,13 +81,14 @@ class TelegramControlCenter(Notifier):
                                               f"command refused for user {user_id}")
             reply = "Access denied."
         else:
-            reply = await self.execute(text)
+            reply = await self.execute(text, user_id)
         if chat_id is not None:
             await self.send(chat_id, reply)
         return reply
 
-    async def execute(self, text: str) -> str:
+    async def execute(self, text: str, user_id: int | None = None) -> str:
         cmd = text.split()[0].split("@")[0].lower() if text else ""
+        uid = int(user_id) if user_id is not None else 0
         pm = self.pm
         if pm is None:
             return "System not running."
@@ -121,23 +125,40 @@ class TelegramControlCenter(Notifier):
                 return tpl.risk(pm.risk_data())
             if cmd == "/report":
                 return tpl.daily_report(pm.daily_report_data())
-            if cmd == "/pause":
+            if cmd == "/pause":  # instant, no confirmation
                 pm.pause("telegram /pause")
-                return "⏸ Paused: no new positions. Protective exits stay active."
-            if cmd == "/resume":
-                ok, remaining = pm.resume()
-                if ok:
-                    for bot in pm.bots.values():
-                        bot.paused = False
-                    return "▶️ Resumed."
-                return ("Pause flag cleared, but trading remains blocked by: " + ", ".join(remaining)
-                        + ". These locks require local manual confirmation (see RISK_POLICY.md).")
-            if cmd == "/stop":
-                n = await pm.stop_trading()
-                return f"⏹ Bots stopped, {n} unfilled entry orders canceled. Positions kept. /resume to continue."
-            if cmd == "/emergency_stop":
-                n = await pm.emergency_stop("telegram /emergency_stop")
-                return f"🚨 Emergency stop active. {n} orders canceled. Clear locally with scripts/emergency_stop.py --clear"
+                return "⏸ Paused: no new positions. Open positions stay managed (stops, take profits, exits)."
+            if cmd == "/emergency_stop":  # instant, no confirmation
+                r = await pm.emergency_stop("telegram /emergency_stop")
+                return (f"🚨 Emergency protocol active. New positions blocked, {r['canceled_entries']} entry orders "
+                        f"canceled{', ' + str(r['entries_left']) + ' pending retry' if r['entries_left'] else ''}. "
+                        f"{len(r['positions'])} open positions kept under protective stops. "
+                        "Clear locally: scripts/emergency_stop.py --clear")
+            if cmd == "/resume":  # two-step
+                checks = await pm.resume_checks()
+                if not checks.ok:
+                    return "▶️ Resume refused - checks failed:\n" + checks.text()
+                pending = self.confirmations.request("resume", uid)
+                return ("Resume checks passed:\n" + checks.text() + f"\n\nConfirm within 2 minutes: "
+                        f"/confirm {pending.code}  (or /cancel). Checks are repeated on confirmation.")
+            if cmd == "/stop":  # two-step
+                pending = self.confirmations.request("stop", uid)
+                return ("⏹ /stop will: block new positions, cancel unfilled entry orders, keep open positions under "
+                        f"protective management. Confirm within 2 minutes: /confirm {pending.code}  (or /cancel)")
+            if cmd == "/confirm":
+                parts = text.split()
+                action, msg = self.confirmations.confirm(parts[1] if len(parts) > 1 else "", uid)
+                if action is None:
+                    return msg
+                if action == "resume":
+                    rep = await pm.resume_confirmed()
+                    return ("▶️ Resumed." if rep.ok else "Resume aborted - checks failed at confirmation:\n") + (
+                        "" if rep.ok else rep.text())
+                if action == "stop":
+                    n = await pm.stop_trading()
+                    return f"⏹ Stopped: new positions blocked, {n} entry orders canceled, positions stay managed."
+            if cmd == "/cancel":
+                return "Request canceled." if self.confirmations.cancel(uid) else "Nothing to cancel."
             if cmd == "/paper":
                 v = pm.paper_validation()
                 return ("🧪 Paper validation progress (minimum criteria, not a profit guarantee):\n"

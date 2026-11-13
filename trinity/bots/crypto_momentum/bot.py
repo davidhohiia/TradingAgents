@@ -151,20 +151,20 @@ class CryptoMomentumBot(BaseBot):
         if locks or self.paused:
             info["entries"] = f"blocked by risk locks {locks}"
         else:
-            selected = self.planner.select(cands, held, matrix, notes)
+            selected = {c.symbol for c in self.planner.select(cands, held, matrix, notes)}
             info["correlation_filter"] = notes.correlation
             cap = self.gateway.capital()
             max_risk = self.gateway.max_trade_risk_usd()
-            for sig in selected:
+            threshold = self.app.quality.threshold(self.strategy_id)
+            for sig in cands:
                 bar_key = str(feats[sig.symbol].index[-1])
                 if self.last_entry_bar.get(sig.symbol) == bar_key:
                     continue  # one entry decision per completed bar
+                self.last_entry_bar[sig.symbol] = bar_key
                 gw = self._gw_for(sig.symbol)
                 book = books[sig.symbol]
                 ask = book.best_ask or sig.entry
-                if (book.spread_pct or 1) * 10_000 > self.cfg.max_spread_bps:
-                    info["symbols"][sig.symbol]["entry"] = [f"spread too wide {book.spread_pct:.4%}"]
-                    continue
+                spread_bps = (book.spread_pct * 10_000) if book.spread_pct is not None else None
                 price = ask * (1 + self.cfg.entry_limit_offset_bps / 10_000)
                 stop = min(sig.stop, price - sig.risk_per_unit)  # keep the planned risk distance from fill price
                 market = gw._engine.venues[gw.venue].market_info(sig.symbol)  # noqa: SLF001
@@ -173,21 +173,45 @@ class CryptoMomentumBot(BaseBot):
                                    self.app.risk.max_position_pct_of_strategy * cap.effective_capital * lev)
                 qty = self.planner.size(sig, max_risk_usd=max_risk, available=cap.available,
                                         max_notional=max_notional, market=market, price=price, leverage=lev)
+                depth = sum(p * q for p, q in book.asks[:5]) if book.asks else None
+                q = self.planner.quality(feats[sig.symbol], sig, spread_bps=spread_bps, depth_usd=depth,
+                                         order_usd=qty * price, held=held, matrix=matrix)
+                sym_info = info["symbols"].setdefault(sig.symbol, {})
+                sym_info["quality"] = {"score": q.score, "grade": q.grade, "threshold": threshold}
+
+                def record(decision: str, why: str = "", cid: str | None = None, sig=sig, q=q) -> None:  # noqa: ANN001
+                    self.repo.add_signal(ts=now, mode=self.mode, strategy_id=self.strategy_id,
+                                         sub_strategy=sig.strategy, symbol=sig.symbol, score=q.score, grade=q.grade,
+                                         threshold=threshold, decision=decision,
+                                         reasons=(why + " | " if why else "") + "; ".join(q.reasons),
+                                         components=q.components, client_order_id=cid)
+
+                if sig.symbol not in selected:
+                    record("rejected_correlation")
+                    continue
+                if spread_bps is None or spread_bps > self.cfg.max_spread_bps:
+                    sym_info["entry"] = [f"spread too wide {spread_bps}"]
+                    record("skipped_spread", f"spread {spread_bps}bps > {self.cfg.max_spread_bps}")
+                    continue
                 if qty <= 0:
-                    info["symbols"][sig.symbol]["entry"] = ["size below venue minimum after risk/capital caps"]
+                    sym_info["entry"] = ["size below venue minimum after risk/capital caps"]
+                    record("skipped_size", "minimum order exceeds the allowed risk/capital")
+                    continue
+                if not q.passes(threshold):
+                    sym_info["entry"] = [f"quality {q.score} < {threshold}"]
+                    record("rejected_quality", f"score {q.score} < {threshold}")
                     continue
                 intent = OrderIntent(
                     strategy_id=self.strategy_id, venue=gw.venue, symbol=sig.symbol, side=Side.BUY,
                     order_type=OrderType.LIMIT, quantity=qty, reference_price=ask, market_data_ts=book.ts,
                     asset_class=AssetClass.CRYPTO, price=price, stop_price=stop,
                     take_profit=price + (sig.take_profit - sig.entry), reason=f"{sig.strategy}: {sig.reasons[0]}"[:300],
-                    sub_strategy=sig.strategy, leverage=lev)
+                    sub_strategy=sig.strategy, leverage=lev, quality_score=q.score)
                 self.pending[intent.client_order_id] = {"trail_mult": sig.trailing_atr_multiplier,
                                                         "trail_act": sig.trailing_activation_r, "level": sig.level}
                 res = await gw.submit(intent)
-                self.last_entry_bar[sig.symbol] = bar_key
-                info["symbols"][sig.symbol]["submitted"] = {"accepted": res.accepted, "why": res.reasons,
-                                                            "strategy": sig.strategy}
+                record("submitted" if res.accepted else "rejected_risk", "; ".join(res.reasons), intent.client_order_id)
+                sym_info["submitted"] = {"accepted": res.accepted, "why": res.reasons, "strategy": sig.strategy}
                 if not res.accepted:
                     self.pending.pop(intent.client_order_id, None)
                 cap = self.gateway.capital()

@@ -98,7 +98,7 @@ def test_committed_data_survives_unclean_shutdown(tmp_path):
 async def test_crash_after_send_before_ack_is_reconciled(tmp_path, config):
     s = build_system(tmp_path, config)
     b = await s.crypto_market.fetch_order_book("BTC/USDT")
-    intent = OrderIntent(strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
+    intent = OrderIntent(quality_score=80, strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
                          order_type=OrderType.LIMIT, quantity=0.0003, reference_price=b.best_ask,
                          price=round(b.best_bid * 0.99, 2), stop_price=b.best_bid * 0.95, market_data_ts=b.ts,
                          asset_class=AssetClass.CRYPTO)
@@ -130,7 +130,7 @@ async def test_crash_before_send_marks_order_failed(tmp_path, config):
         raise SystemExit("crash before network call")
 
     s.crypto.create_order = crash
-    intent = OrderIntent(strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
+    intent = OrderIntent(quality_score=80, strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
                          order_type=OrderType.MARKET, quantity=0.0003, reference_price=b.best_ask,
                          stop_price=b.best_ask * 0.97, market_data_ts=b.ts, asset_class=AssetClass.CRYPTO)
     with pytest.raises(SystemExit):
@@ -145,7 +145,7 @@ async def test_crash_before_send_marks_order_failed(tmp_path, config):
 async def test_positions_and_risk_state_survive_restart(tmp_path, config):
     s = build_system(tmp_path, config)
     b = await s.crypto_market.fetch_order_book("BTC/USDT")
-    await s.engine.submit(OrderIntent(strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
+    await s.engine.submit(OrderIntent(quality_score=80, strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
                                       order_type=OrderType.MARKET, quantity=0.0003, reference_price=b.best_ask,
                                       stop_price=b.best_ask * 0.97, market_data_ts=b.ts, asset_class=AssetClass.CRYPTO))
     s.risk.emergency_stop("test")

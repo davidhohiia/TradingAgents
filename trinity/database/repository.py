@@ -202,13 +202,13 @@ class Repository:
             "INSERT INTO orders (client_order_id, exchange_order_id, strategy_id, venue, symbol, mode, side, "
             "order_type, quantity, price, stop_price, take_profit, reduce_only, status, filled_quantity, "
             "avg_fill_price, fee_usd, reserved_usd, reason, parent_client_order_id, error, created_at, updated_at, "
-            "sub_strategy, leverage) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "sub_strategy, leverage, quality_score) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 o.client_order_id, o.exchange_order_id, o.strategy_id, o.venue, o.symbol, o.mode.value,
                 o.side.value, o.order_type.value, o.quantity, o.price, o.stop_price, o.take_profit,
                 int(o.reduce_only), o.status.value, o.filled_quantity, o.avg_fill_price, o.fee_usd,
                 o.reserved_usd, o.reason, o.parent_client_order_id, o.error,
-                ts_to_str(o.created_at), ts_to_str(o.updated_at), o.sub_strategy, o.leverage,
+                ts_to_str(o.created_at), ts_to_str(o.updated_at), o.sub_strategy, o.leverage, o.quality_score,
             ),
         )
 
@@ -509,6 +509,22 @@ class Repository:
             sql += " WHERE accepted=1"
         sql += " ORDER BY id DESC LIMIT ?"
         return self.query(sql, (limit,))
+
+    # ------------------------------------------------------------------ signals (Trade Quality Score)
+    def add_signal(self, *, ts: datetime, mode: Mode, strategy_id: str, sub_strategy: str, symbol: str, score: int,
+                   grade: str, threshold: int, decision: str, reasons: str = "", components: dict[str, Any] | None = None,
+                   client_order_id: str | None = None) -> int:
+        cur = self.execute(
+            "INSERT INTO signals (ts, mode, strategy_id, sub_strategy, symbol, score, grade, threshold, decision, "
+            "reasons, components_json, client_order_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (ts_to_str(ts), mode.value, strategy_id, sub_strategy, symbol, score, grade, threshold, decision,
+             reasons[:1000], json.dumps(components or {}), client_order_id))
+        return int(cur.lastrowid)
+
+    def list_signals(self, mode: Mode | None = None, limit: int = 100) -> list[sqlite3.Row]:
+        if mode:
+            return self.query("SELECT * FROM signals WHERE mode=? ORDER BY id DESC LIMIT ?", (mode.value, limit))
+        return self.query("SELECT * FROM signals ORDER BY id DESC LIMIT ?", (limit,))
 
     # ------------------------------------------------------------------ trade journal / Google Sheets outbox
     def insert_journal_trade(self, t: dict[str, Any], ts: datetime) -> bool:

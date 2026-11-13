@@ -132,7 +132,7 @@ async def test_reinvested_profit_increases_strategy_capital(system, config):
     cap = pm.allocator.compute("crypto_momentum", system.positions.all(), [], 30.0)
     assert cap.effective_capital == pytest.approx(180)
     b = await system.crypto_market.fetch_order_book("BTC/USDT")
-    res = await system.engine.submit(OrderIntent(
+    res = await system.engine.submit(OrderIntent(quality_score=80, 
         strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY, order_type=OrderType.MARKET,
         quantity=0.0003, reference_price=b.best_ask, stop_price=b.best_ask * 0.98, market_data_ts=b.ts,
         asset_class=AssetClass.CRYPTO))

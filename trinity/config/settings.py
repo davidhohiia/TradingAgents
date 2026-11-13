@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from trinity.core.log import register_secret
@@ -142,6 +142,7 @@ class CapitalConfig(BaseModel):
 
 
 class RiskConfig(BaseModel):
+    model_config = ConfigDict(frozen=True)  # limits cannot be changed at runtime by any module
     max_risk_per_trade_pct: float = Field(0.0075, gt=0, le=0.01)
     max_total_open_risk_pct: float = Field(0.03, gt=0, le=0.06)
     max_daily_loss_pct: float = Field(0.03, gt=0, le=0.10)
@@ -420,7 +421,29 @@ class InstrumentsFile(BaseModel):
     currency: CurrencyConfig = CurrencyConfig()
 
 
+class QualityConfig(BaseModel):
+    """Trade Quality Score thresholds. Per-bot values may only be HIGHER than the profile minimum."""
+
+    model_config = ConfigDict(frozen=True)
+    min_score: int = Field(70, ge=0, le=100)
+    per_bot: dict[str, int] = Field(default_factory=dict)
+
+    def threshold(self, strategy_id: str) -> int:
+        return max(self.min_score, int(self.per_bot.get(strategy_id, self.min_score)))
+
+
+class EmergencyConfig(BaseModel):
+    """Emergency protocol HOLD_PROTECTED (SPEC_4.0.md A3)."""
+
+    model_config = ConfigDict(frozen=True)
+    default_stop_pct: float = Field(0.03, gt=0, le=0.2)
+    guardian_interval_seconds: float = Field(15, ge=5, le=120)
+
+
 class AppConfig(BaseModel):
+    profile: str = "BALANCED"
+    quality: QualityConfig = QualityConfig()
+    emergency: EmergencyConfig = EmergencyConfig()
     capital: CapitalConfig
     risk: RiskConfig
     leverage: LeverageConfig = LeverageConfig()
@@ -439,6 +462,11 @@ class AppConfig(BaseModel):
 
     @model_validator(mode="after")
     def _cross_check(self) -> AppConfig:
+        from trinity.risk.profiles import get_profile, profile_violations
+
+        problems = profile_violations(get_profile(self.profile), self.risk, self.quality)
+        if problems:
+            raise ValueError(f"configuration does not match risk profile {self.profile}: " + "; ".join(problems))
         for sym in self.strategies.crypto_momentum.symbols + self.strategies.stock_trend.symbols:
             if sym not in self.instruments:
                 raise ValueError(f"strategy symbol {sym} missing from instruments.yaml")
@@ -471,6 +499,9 @@ def load_app_config(config_dir: Path | None = None) -> AppConfig:
         capital=CapitalConfig.model_validate(strat["capital"]),
         risk=RiskConfig.model_validate(strat["risk"]),
         leverage=LeverageConfig.model_validate(strat.get("leverage", {})),
+        profile=str(strat.get("profile", "BALANCED")),
+        quality=QualityConfig.model_validate(strat.get("quality", {})),
+        emergency=EmergencyConfig.model_validate(strat.get("emergency", {})),
         paper=PaperConfig.model_validate(strat.get("paper", {})),
         strategies=StrategiesConfig.model_validate(strat["strategies"]),
         instruments=inst.instruments,

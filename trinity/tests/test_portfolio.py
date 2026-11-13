@@ -72,7 +72,7 @@ async def resting_buy(system):
     """A deterministic resting entry order (bots may legitimately find no signal)."""
     b = await system.crypto_market.fetch_order_book("BTC/USDT")
     px = round(b.best_bid * 0.98, 2)
-    res = await system.engine.submit(OrderIntent(
+    res = await system.engine.submit(OrderIntent(quality_score=80, 
         strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY, order_type=OrderType.LIMIT,
         quantity=0.0003, reference_price=b.best_ask, price=px, stop_price=px * 0.98, market_data_ts=b.ts,
         asset_class=AssetClass.CRYPTO))
@@ -81,7 +81,7 @@ async def resting_buy(system):
 
 async def market_buy(system, symbol="ETH/USDT", qty=0.005):
     b = await system.crypto_market.fetch_order_book(symbol)
-    res = await system.engine.submit(OrderIntent(
+    res = await system.engine.submit(OrderIntent(quality_score=80, 
         strategy_id="crypto_momentum", venue="crypto", symbol=symbol, side=Side.BUY, order_type=OrderType.MARKET,
         quantity=qty, reference_price=b.best_ask, stop_price=b.best_ask * 0.97, market_data_ts=b.ts,
         asset_class=AssetClass.CRYPTO))
@@ -150,26 +150,29 @@ async def test_telegram_emergency_stop_and_resume_cannot_bypass(system, config):
     await run_for(pm, system, 300)
     tg, _ = telegram(pm)
     reply = await tg.handle_update(update(OWNER, "/emergency_stop"))
-    assert "Emergency stop" in reply
+    assert "Emergency protocol active" in reply
     assert "emergency_stop" in system.risk.blocking_locks()
     assert system.repo.list_active_orders(Mode.PAPER) == []
     b = await system.crypto_market.fetch_order_book("BTC/USDT")
-    res = await system.engine.submit(OrderIntent(
+    res = await system.engine.submit(OrderIntent(quality_score=80, 
         strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY, order_type=OrderType.MARKET,
         quantity=0.0002, reference_price=b.best_ask, market_data_ts=b.ts, asset_class=AssetClass.CRYPTO,
         stop_price=b.best_ask * 0.97))
     assert not res.accepted
     reply = await tg.handle_update(update(OWNER, "/resume", 2))
-    assert "remains blocked" in reply and "emergency_stop" in reply
+    assert "Resume refused" in reply and "emergency_stop" in reply and "/confirm" not in reply
     assert "emergency_stop" in system.risk.blocking_locks()
 
 
 async def test_telegram_pause_resume(system, config):
     pm, _ = make_pm(system, config)
     tg, _ = telegram(pm)
-    await tg.execute("/pause")
+    await tg.execute("/pause", OWNER)
     assert system.risk.blocking_locks() == ["paused"]
-    assert (await tg.execute("/resume")).startswith("▶️")
+    step1 = await tg.execute("/resume", OWNER)
+    assert "/confirm" in step1 and system.risk.blocking_locks() == ["paused"]  # not resumed yet
+    code = step1.split("/confirm ")[1].split()[0]
+    assert (await tg.execute(f"/confirm {code}", OWNER)).startswith("▶️")
     assert system.risk.blocking_locks() == []
 
 
@@ -230,11 +233,11 @@ async def test_gateway_cannot_act_for_other_strategy(system):
     gw = OrderGateway(system.engine, "crypto_momentum", "crypto")
     b = await system.crypto_market.fetch_order_book("BTC/USDT")
     with pytest.raises(StrategyMismatch):
-        await gw.submit(OrderIntent(strategy_id="stock_trend", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
+        await gw.submit(OrderIntent(quality_score=80, strategy_id="stock_trend", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
                                     order_type=OrderType.MARKET, quantity=0.0002, reference_price=b.best_ask,
                                     market_data_ts=b.ts, asset_class=AssetClass.CRYPTO))
     other = OrderGateway(system.engine, "stock_trend", "stocks")
-    res = await gw.submit(OrderIntent(strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
+    res = await gw.submit(OrderIntent(quality_score=80, strategy_id="crypto_momentum", venue="crypto", symbol="BTC/USDT", side=Side.BUY,
                                       order_type=OrderType.MARKET, quantity=0.0002, reference_price=b.best_ask,
                                       market_data_ts=b.ts, asset_class=AssetClass.CRYPTO, stop_price=b.best_ask * 0.97))
     assert not await other.cancel(res.client_order_id)

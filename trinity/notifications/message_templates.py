@@ -14,7 +14,7 @@ HELP = (
     "/status /balance /pnl /positions /trades\n"
     "/crypto (/grid) /stocks /arbitrage /risk /report\n"
     "/capital /strategies /journal\n"
-    "/pause /resume /stop /emergency_stop\n"
+    "/pause /emergency_stop (instant) | /resume /stop (two-step: /confirm <code>, /cancel)\n"
     "/paper /live_status"
 )
 

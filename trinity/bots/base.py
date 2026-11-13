@@ -101,7 +101,9 @@ class BaseBot(ABC):
 
     async def safe_step(self) -> bool:
         """Run one step, converting recoverable errors into status. Returns success."""
-        if not self.running or self.paused:
+        # NOTE: "paused" only disables NEW entries (checked inside each bot). The step keeps running so
+        # open positions stay managed (stops, take profits, exits) - SPEC_4.0 A2/A3.
+        if not self.running:
             return True
         try:
             await self.step()
